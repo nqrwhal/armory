@@ -1,0 +1,68 @@
+# armory configuration
+#
+# Sources poll public/authenticated listing pages at polite intervals and store
+# every listing in armory.db. Keywords live in the DB (`armory keywords add X`)
+# and fire alerts on first sight of a matching listing.
+
+# Tiny JSON state file: per-source last-check time + recent-ID ring (dedupe),
+# plus your keywords and rules. No database.
+state_path: armory.state.json
+
+sources:
+  calguns:
+    enabled: true
+    driver: http
+    poll_interval: 120          # seconds
+    forums:                     # vBulletin nodeids (verified 2026-09)
+      - handguns                # 121
+      - long_guns               # 44
+      - parts_accessories       # 45
+      - ammo                    # 74
+      - reloading               # 116
+      - non_firearms            # 49
+      - wtb                     # 48
+      - commercial              # 47
+
+  tacswap:
+    enabled: true
+    driver: http
+    poll_interval: 120
+    categories:
+      - firearm
+      - suppressors
+      - firearm_parts
+      - firearm_accessories
+      - nightvision
+      - ammo
+      - optics
+      - knives
+      - tactical_kit
+      - misc
+    pages_per_poll: 1
+
+  gafshub:
+    enabled: true
+    driver: impersonate         # browser TLS fingerprint; site is behind Cloudflare + login wall
+    poll_interval: 120
+
+  caguns:
+    enabled: true
+    driver: impersonate         # Cloudflare managed challenge; needs your session cookies
+    poll_interval: 600          # site is explicitly anti-scraper — keep this slow
+    categories:                 # alias paths
+      - firearms
+      - longguns
+      - ammo
+      - reloading
+      - wtb
+
+# Seeded into the keyword DB on first run; afterwards manage with `armory keywords`.
+keywords: []
+
+alerts:
+  max_per_cycle: 6              # overflow matches are summarized in one note, not spammed
+  discord:
+    enabled: true               # needs DISCORD_WEBHOOK_URL in .env
+  imessage:
+    enabled: false              # needs IMESSAGE_TO in .env + Messages.app logged in
+    max_per_message: 6

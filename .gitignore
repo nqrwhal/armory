@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+armory.state.json
+armory.state.json.lock
+
+.env
+.pytest_cache/
+.zcode/
+gafshub.cookies.json
