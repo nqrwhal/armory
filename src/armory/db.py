@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS valuations (
   external_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   asking_price REAL,
+  asking_total REAL,                     -- price × qty on per-item listings
+  asking_per_item INTEGER DEFAULT 0,
   market_low REAL, market_mid REAL, market_high REAL,
   attachments_json TEXT,
   ca_roster TEXT,                        -- on | off | unknown | n/a
@@ -137,6 +139,14 @@ class Db:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for DBs created before a feature."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(valuations)")}
+        for col, decl in (("asking_total", "REAL"), ("asking_per_item", "INTEGER DEFAULT 0")):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE valuations ADD COLUMN {col} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -321,12 +331,14 @@ class Db:
     def insert_valuation(self, source: str, external_id: str, result: dict, model_used: str) -> int:
         cur = self.conn.execute(
             """INSERT INTO valuations (source, external_id, created_at, asking_price,
+                 asking_total, asking_per_item,
                  market_low, market_mid, market_high, attachments_json, ca_roster,
                  off_roster_premium_pct, deal_score, verdict, summary, make, model_name,
                  variant, confidence, sources_json, model_used, error)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 source, external_id, utcnow_iso(), result.get("asking_price"),
+                result.get("asking_total"), int(bool(result.get("asking_price_is_per_item"))),
                 result.get("market_low"), result.get("market_mid"), result.get("market_high"),
                 json.dumps(result.get("attachments")) if result.get("attachments") else None,
                 result.get("ca_roster"), result.get("off_roster_premium_pct"),

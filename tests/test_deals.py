@@ -514,6 +514,51 @@ def test_upsert_structured_row_and_multisource_queue():
         assert hit.quality == "region" and hit.label == "inland empire"
 
 
+def test_valuation_per_item_pricing_uses_total():
+    """'$770 each' for two guns must score/alert against $1,540, not $770."""
+    from armory.config import ValuationConfig
+    from armory.valuation import ValuationEngine
+
+    verdict = _verdict(76)
+    verdict.update({
+        "asking_price_is_per_item": True,
+        "asking_total": 1540.0,
+        "market_mid": 1500.0,
+        "asking_price": 770.0,  # the engine overwrites this from the listing row anyway
+    })
+    db = _seed_valuation_db()
+    db.conn.execute("UPDATE listings SET price_usd=770, price='$770' WHERE external_id='1'")
+    db.conn.commit()
+    alerters = RecordingAlerters()
+    engine = ValuationEngine(db, FakeLLM(verdict), ValuationConfig(rate_per_minute=0),
+                             search=FakeSearch(), roster=None, alerters=alerters, radius_miles=100)
+    engine.run(limit=5)
+    assert len(alerters.sent) == 1
+    sent = alerters.sent[0]
+    assert "$1540 ($770 each)" in sent.price
+    assert "$1540 ($770 each)" in sent.body
+    v = db.latest_valuation("calguns", "1")
+    assert v["asking_total"] == 1540.0 and v["asking_per_item"] == 1
+
+
+def test_valuation_per_item_without_total_falls_back_to_unit_price():
+    from armory.config import ValuationConfig
+    from armory.valuation import ValuationEngine
+
+    verdict = _verdict(50, verdict="fair")
+    verdict.update({"asking_price_is_per_item": True, "asking_total": None})
+    db = _seed_valuation_db()
+    db.conn.execute("UPDATE listings SET price_usd=770, price='$770' WHERE external_id='1'")
+    db.conn.commit()
+    engine = ValuationEngine(db, FakeLLM(verdict), ValuationConfig(rate_per_minute=0),
+                             search=FakeSearch(), roster=None, radius_miles=100)
+    listing = db.valuation_queue(90, 100.0, gun_forums={"calguns": ["handguns"]})[0]
+    outcome = engine._work_one(listing)
+    v = outcome["valuation"]
+    # the guard: a per-item flag with no total must never read as free/zero
+    assert v["asking_price"] == 770.0 and v["asking_total"] == 770.0
+
+
 def test_engine_lazy_body_fetch():
     from armory.config import ValuationConfig
     from armory.valuation import ValuationEngine

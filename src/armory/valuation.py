@@ -61,6 +61,16 @@ Method:
    asking <=60% mid → 90-100 | 60-75% → 80-90 | 75-85% → 65-80 |
    85-95% → 45-65 | 95-110% → 20-45 | >110% → 0-20.
    Cap 'great'/'good' verdicts when the listing smells like a scam; say so.
+5. MULTI-ITEM PRICING — read the listing like a buyer, not a regex. Many
+   listings sell several guns in one thread. If the stated price is PER ITEM
+   ("$X each", "apiece", "per gun", or one price beside multiple firearms
+   with no "for both/for all"), then the total asking price is price ×
+   quantity. ALWAYS score against the TOTAL, never the per-item number, and
+   set asking_price_is_per_item=true with asking_total filled in. Never
+   describe a per-item price as buying the whole lot. If the pricing is
+   genuinely ambiguous, say so in caveats, set asking_total to your best
+   conservative reading, and shade the deal score down — a mis-read bundle
+   is worse than a missed marginal deal.
 
 Return STRICT JSON only:
 {"make": str|null, "model": str|null, "variant": str|null,
@@ -70,6 +80,8 @@ Return STRICT JSON only:
  "value_basis": "1-2 sentences: what the range is built on",
  "ca_roster": "on|off|unknown|n/a",
  "off_roster_premium_pct": number|null,
+ "asking_price_is_per_item": true|false,
+ "asking_total": number|null,
  "deal_score": 0-100,
  "verdict": "great|good|fair|poor|overpriced|unclear",
  "summary": "2-3 sentences a buyer would actually want to read",
@@ -212,13 +224,16 @@ class ValuationEngine:
         att = v.get("attachments") or []
         att_lines = "\n".join(f"  • {a.get('item')} (+${_f(a.get('est_value_usd'), 0):.0f})" for a in att[:6])
         mid = _f(v.get("market_mid"))
-        asking = _f(v.get("asking_price")) or listing.get("price_usd")
+        per_item = bool(v.get("asking_price_is_per_item"))
+        # per-item listings are scored against the TOTAL ask, never the unit price
+        asking = (_f(v.get("asking_total")) if per_item else None) or _f(v.get("asking_price")) or listing.get("price_usd")
+        unit_note = f" (${_f(v.get('asking_price'), 0):.0f} each)" if per_item else ""
         delta = f"{(asking / mid - 1) * 100:+.0f}% vs market mid" if mid and asking else ""
         roster = v.get("ca_roster")
         roster_note = f"\n🇨🇦 **OFF-ROSTER** (est. premium {_f(v.get('off_roster_premium_pct'), 0):.0f}%)" if roster == "off" else ""
         body = (
             f"{v.get('summary') or ''}\n"
-            f"**Ask ${asking:.0f}** {delta} · est value "
+            f"**Ask ${asking:.0f}{unit_note}** {delta} · est value "
             f"${_f(v.get('market_low'), 0):.0f}–${_f(v.get('market_high'), 0):.0f}{roster_note}\n"
             + (f"**Included:**\n{att_lines}\n" if att_lines else "")
             + (f"⚠️ {v['caveats']}" if v.get("caveats") else "")
@@ -228,7 +243,7 @@ class ValuationEngine:
             external_id=listing["external_id"],
             url=listing["url"],
             title=f"🔥 DEAL {v.get('deal_score')}/100 — {(listing.get('title') or '')[:180]}",
-            price=f"${asking:.0f}" if asking else listing.get("price"),
+            price=f"${asking:.0f}{unit_note}" if asking else listing.get("price"),
             body=body[:3900],
             location=loc,
             author=listing.get("author"),
@@ -276,8 +291,14 @@ class ValuationEngine:
             # the queue row's price is the ask we're judging — the model's echo
             # of it can lag (e.g. after a price-edit re-queue), so overwrite
             v["asking_price"] = listing.get("price_usd")
-            for key in ("market_low", "market_mid", "market_high", "off_roster_premium_pct", "asking_price"):
+            for key in ("market_low", "market_mid", "market_high", "off_roster_premium_pct",
+                        "asking_price", "asking_total"):
                 v[key] = _f(v.get(key))
+            v["asking_price_is_per_item"] = bool(v.get("asking_price_is_per_item"))
+            if v["asking_price_is_per_item"] and not v.get("asking_total"):
+                # per-item flag without a total is a mis-parse — don't let it
+                # masquerade as a screaming deal
+                v["asking_total"] = v.get("asking_price")
             try:
                 v["deal_score"] = max(0, min(100, int(v.get("deal_score"))))
             except (TypeError, ValueError):
