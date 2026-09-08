@@ -27,7 +27,9 @@ valuation:
   thinking: true
   web_search: true         # z.ai web-search MCP, same LLM_API_KEY
   alert_min_score: 70      # alert at/above this deal score (0-100)
-  max_per_cycle: 2         # valuations per watch cycle (latency-tolerant)
+  rate_per_minute: 5       # launch pacing; each valuation runs ~2 min so
+  max_concurrent: 10       # throughput needs parallel workers
+  max_per_cycle: 5         # queue rows drained per run()/watch cycle
   eval_window_days: 90     # only recently-active listings get valued
   sources: [calguns, caguns]
   gun_forums:              # source → its gun categories

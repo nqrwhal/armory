@@ -35,11 +35,19 @@ def _embed(listing: Listing) -> dict:
     if listing.scam_risk in ("medium", "high") and listing.scam_reason:
         desc_lines.append(f":warning: {listing.scam_risk} scam risk — {listing.scam_reason}")
     if listing.body:
-        desc_lines.append(listing.body[:300] + ("…" if len(listing.body) > 300 else ""))
+        # full text — Discord collapses long descriptions behind its own
+        # "Show more" toggle, so no preview truncation here
+        desc_lines.append(listing.body)
+    title = (f"⚠️ {listing.title}" if listing.scam_risk == "high" else listing.title)[:256]
+    # hard API limits: 4096/description, 6000 total across the embed.
+    # 3600 leaves room for title (≤256) + footer (≤2048) worst case.
+    desc = "\n".join(desc_lines)
+    if len(desc) > 3600:
+        desc = desc[:3597] + "…"
     embed: dict = {
-        "title": (f"⚠️ {listing.title}" if listing.scam_risk == "high" else listing.title)[:256],
+        "title": title,
         "url": listing.url,
-        "description": "\n".join(desc_lines)[:4096],
+        "description": desc,
         "color": 0xE74C3C if listing.scam_risk == "high" else _style(listing.source)[1],
     }
     if listing.author:

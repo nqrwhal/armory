@@ -117,10 +117,11 @@ class ValuationEngine:
 
     # --- context building ---
 
-    def _ensure_identity(self, listing: dict) -> None:
-        """Backfilled rows never met the poller's classify pass — fill make/model."""
+    def _ensure_identity(self, listing: dict) -> dict | None:
+        """Backfilled rows never met the poller's classify pass — fill make/model.
+        Returns LLM fields for the main thread to persist (or None)."""
         if listing.get("brand") and listing.get("model"):
-            return
+            return None
         probe = Listing(
             source=listing["source"], external_id=listing["external_id"], url=listing["url"],
             title=listing["title"] or "", body=(listing.get("body") or "")[:900],
@@ -129,17 +130,18 @@ class ValuationEngine:
         try:
             results = self.llm.classify_batch([probe], [])
         except LLMError:
-            return
+            return None
         result = results.get(listing["external_id"])
-        if result:
-            apply_result(probe, result)
-            self.db.set_llm_fields(listing["source"], listing["external_id"], {
-                "brand": probe.brand, "model": probe.model, "item_type": probe.item_type,
-                "condition": probe.condition, "scam_risk": probe.scam_risk,
-                "wants_to": probe.wants_to,
-            })
-            for key in ("brand", "model", "condition"):
-                listing[key] = getattr(probe, key)
+        if not result:
+            return None
+        apply_result(probe, result)
+        for key in ("brand", "model", "condition"):
+            listing[key] = getattr(probe, key)
+        return {
+            "brand": probe.brand, "model": probe.model, "item_type": probe.item_type,
+            "condition": probe.condition, "scam_risk": probe.scam_risk,
+            "wants_to": probe.wants_to,
+        }
 
     def _roster_hint(self, listing: dict) -> str:
         if listing.get("forum") not in self.handgun_forums.get(listing.get("source", ""), set()):
@@ -148,22 +150,24 @@ class ValuationEngine:
             return "unknown (no local roster data)"
         return self.roster.lookup(listing["brand"], listing["model"])
 
-    def _ensure_body(self, listing: dict, log=_log) -> None:
+    def _ensure_body(self, listing: dict, log=_log) -> tuple[str, str | None] | None:
         """Valuation context wants the FULL ad text; snippets are thin.
-        Fetch lazily here so only in-radius queue rows cost a request."""
+        Fetch lazily so only in-radius queue rows cost a request. Returns
+        (body, image_url) for the main thread to persist (None if unchanged)."""
         adapter = self.adapters.get(listing.get("source", ""))
         if adapter is None or not getattr(adapter, "thread_body", None):
-            return
+            return None
         body = listing.get("body") or ""
         if body and len(body) >= 500:
-            return
+            return None
         try:
             full, image_url = adapter.thread_body(listing["url"])
         except Exception as exc:  # noqa: BLE001 — thin context beats no context
             log(f"{listing['source']}: body fetch failed for {listing['external_id']}: {exc}")
-            return
-        self.db.set_body(listing["source"], listing["external_id"], full, image_url)
+            return None
         listing["body"] = full
+        listing["image_url"] = image_url or listing.get("image_url")
+        return full, image_url
 
     def _comps_block(self, listing: dict) -> str:
         if not listing.get("brand") or not listing.get("model"):
@@ -188,7 +192,7 @@ class ValuationEngine:
         loc = listing.get("city") or listing.get("location_raw") or "unknown"
         parts.append(f"LOCATION: {loc} ({listing.get('distance_miles'):.0f} mi away, geo={listing.get('geo_quality')})")
         parts.append(f"ROSTER LOOKUP (deterministic): {self._roster_hint(listing)}")
-        parts.append(f"LOCAL COMPS (our own DB, same make+model):\n{self._comps_block(listing)}")
+        parts.append(f"LOCAL COMPS (our own DB, same make+model):\n{listing.get('comps_block') or self._comps_block(listing)}")
         parts.append(f"LISTING BODY:\n{(listing.get('body') or '(no body fetched)')[:4000]}")
         return "\n\n".join(parts)
 
@@ -249,44 +253,84 @@ class ValuationEngine:
         return bool(prev_ask and ask and ask < prev_ask * 0.95)
 
     def value_one(self, listing: dict, log=_log) -> dict:
-        """Full valuation for one queue row. Returns the stored result dict."""
-        self._ensure_identity(listing)
-        self._ensure_body(listing, log=log)
+        """Full valuation for one queue row (single-threaded path)."""
         previous = self.db.latest_valuation(listing["source"], listing["external_id"])
-        tools = [WEB_SEARCH_TOOL] if self.search else []
-        user = self._user_prompt(listing)
-        reply = self.llm.run_tool_loop(
-            VALUATION_SYSTEM, user, tools, self._executor,
-            model=self.cfg.model, thinking="on" if self.cfg.thinking else "disabled",
-        )
-        v = extract_json(reply)
-        # the queue row's price is the ask we're judging — the model's echo
-        # of it can lag (e.g. after a price-edit re-queue), so overwrite
-        v["asking_price"] = listing.get("price_usd")
-        # sanitize numeric fields
-        for key in ("market_low", "market_mid", "market_high", "off_roster_premium_pct", "asking_price"):
-            v[key] = _f(v.get(key))
-        try:
-            v["deal_score"] = max(0, min(100, int(v.get("deal_score"))))
-        except (TypeError, ValueError):
-            v["deal_score"] = None
-        if v.get("verdict") not in ("great", "good", "fair", "poor", "overpriced", "unclear"):
-            v["verdict"] = "unclear"
-        vid = self.db.insert_valuation(listing["source"], listing["external_id"], v, self.cfg.model)
+        outcome = self._work_one(listing, log=log)
+        return self._finish_one(listing, previous, outcome, {"queued": 1, "valued": 0, "alerted": 0, "errors": 0}, log)
 
+    # --- worker: pure LLM/network work, NO DB access (keeps SQLite
+    # single-threaded when valuations run concurrently) ---
+
+    def _work_one(self, listing: dict, log=_log) -> dict:
+        """Returns {'identity': ..., 'body': ..., 'valuation': v} or {'error': ...}."""
+        try:
+            identity = self._ensure_identity(listing)
+            fetched_body = self._ensure_body(listing, log=log)
+            tools = [WEB_SEARCH_TOOL] if self.search else []
+            user = self._user_prompt(listing)
+            reply = self.llm.run_tool_loop(
+                VALUATION_SYSTEM, user, tools, self._executor,
+                model=self.cfg.model, thinking="on" if self.cfg.thinking else "disabled",
+            )
+            v = extract_json(reply)
+            # the queue row's price is the ask we're judging — the model's echo
+            # of it can lag (e.g. after a price-edit re-queue), so overwrite
+            v["asking_price"] = listing.get("price_usd")
+            for key in ("market_low", "market_mid", "market_high", "off_roster_premium_pct", "asking_price"):
+                v[key] = _f(v.get(key))
+            try:
+                v["deal_score"] = max(0, min(100, int(v.get("deal_score"))))
+            except (TypeError, ValueError):
+                v["deal_score"] = None
+            if v.get("verdict") not in ("great", "good", "fair", "poor", "overpriced", "unclear"):
+                v["verdict"] = "unclear"
+            return {"identity": identity, "body": fetched_body, "valuation": v}
+        except LLMError as exc:
+            return {"error": str(exc)[:400]}
+
+    def _finish_one(self, listing: dict, previous: dict | None, outcome: dict, stats: dict, log=_log) -> dict:
+        """Main-thread persistence + alerting for one completed worker."""
+        if outcome.get("identity"):
+            self.db.set_llm_fields(listing["source"], listing["external_id"], outcome["identity"])
+        if outcome.get("body"):
+            body_text, image_url = outcome["body"]
+            self.db.set_body(listing["source"], listing["external_id"], body_text, image_url)
+        v = outcome.get("valuation")
+        if v is None:
+            stats["errors"] += 1
+            self.db.insert_valuation(
+                listing["source"], listing["external_id"], {"error": outcome.get("error")}, self.cfg.model
+            )
+            log(f"valuation failed for {listing['external_id']}: {str(outcome.get('error'))[:140]}")
+            return stats
+        vid = self.db.insert_valuation(listing["source"], listing["external_id"], v, self.cfg.model)
+        stats["valued"] += 1
         if self._should_alert(v, previous) and self.alerters:
             errors = self.alerters.send_all([self._alert_listing(listing, v)])
             for err in errors:
                 log(f"! deal alert error: {err}")
             if not errors:
                 self.db.mark_valuation_alerted(vid)
+                stats["alerted"] += 1
                 log(
                     f"🔥 deal alert: {listing['title'][:60]!r} "
                     f"score={v['deal_score']} ask=${_f(v.get('asking_price'), 0):.0f}"
                 )
-        return v
+        if v.get("deal_score") is not None:
+            log(
+                f"valued {listing['external_id']}: {v.get('verdict')} "
+                f"({v['deal_score']}/100) ask=${_f(v.get('asking_price'), 0):.0f} "
+                f"mid=${_f(v.get('market_mid'), 0):.0f} — {(listing.get('title') or '')[:48]}"
+            )
+        return stats
 
     def run(self, limit: int | None = None, log=_log) -> dict:
+        """Drain the queue: workers in a paced pool, DB writes on this thread.
+
+        Each valuation takes ~2 min of model+web time, so hitting
+        rate_per_minute requires concurrency — launches are spaced at
+        60/rate seconds, up to max_concurrent in flight.
+        """
         cap = limit or self.cfg.max_per_cycle
         queue = self.db.valuation_queue(
             window_days=self.cfg.eval_window_days,
@@ -295,20 +339,27 @@ class ValuationEngine:
             gun_forums=self.cfg.gun_forums,
         )
         stats = {"queued": len(queue), "valued": 0, "alerted": 0, "errors": 0}
-        for listing in queue:
-            try:
-                v = self.value_one(listing, log=log)
-                stats["valued"] += 1
-                if v.get("deal_score") is not None:
-                    log(
-                        f"valued {listing['external_id']}: {v.get('verdict')} "
-                        f"({v['deal_score']}/100) ask=${_f(v.get('asking_price'), 0):.0f} "
-                        f"mid=${_f(v.get('market_mid'), 0):.0f} — {(listing.get('title') or '')[:48]}"
-                    )
-            except LLMError as exc:
-                stats["errors"] += 1
-                self.db.insert_valuation(
-                    listing["source"], listing["external_id"], {"error": str(exc)[:400]}, self.cfg.model
-                )
-                log(f"valuation failed for {listing['external_id']}: {str(exc)[:140]}")
+        if not queue:
+            return stats
+        pace = (60.0 / self.cfg.rate_per_minute) if getattr(self.cfg, "rate_per_minute", 0) else 0.0
+        workers = max(1, min(getattr(self.cfg, "max_concurrent", 1) or 1, len(queue)))
+        # all DB reads up front, on this thread — workers stay pure
+        previous = {}
+        for l in queue:
+            previous[l["external_id"]] = self.db.latest_valuation(l["source"], l["external_id"])
+            l["comps_block"] = self._comps_block(l)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = []
+            for i, listing in enumerate(queue):
+                futures.append(ex.submit(self._work_one, listing, log))
+                if pace and i < len(queue) - 1:
+                    time.sleep(pace)
+            for listing, fut in zip(queue, futures):
+                try:
+                    outcome = fut.result()
+                except Exception as exc:  # noqa: BLE001 — worker exploded; record and continue
+                    outcome = {"error": f"{type(exc).__name__}: {exc}"[:400]}
+                stats = self._finish_one(listing, previous[listing["external_id"]], outcome, stats, log)
         return stats

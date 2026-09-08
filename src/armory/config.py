@@ -44,7 +44,11 @@ class ValuationConfig(BaseModel):
     thinking: bool = True
     web_search: bool = True       # needs the z.ai web-search MCP (same key)
     alert_min_score: int = 70     # deal alerts at/above this score
-    max_per_cycle: int = 2        # valuations drained per watch cycle
+    # throughput: each valuation runs ~2 min, so hitting rate_per_minute
+    # needs concurrency — launches spaced 60/rate s, up to max_concurrent
+    rate_per_minute: int = 5      # 0 = no pacing
+    max_concurrent: int = 10
+    max_per_cycle: int = 5        # queue rows drained per run()/watch cycle
     eval_window_days: int = 90    # only recently-active listings get valued
     sources: list[str] = Field(default_factory=lambda: ["calguns"])
     # source → its gun categories (queue filter + handgun/roster detection)

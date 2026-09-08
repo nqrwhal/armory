@@ -13,7 +13,7 @@ from armory.adapters.calguns import CalgunsAdapter, parse_title, parse_vb_date
 from armory.config import SourceConfig
 from armory.db import Db, sql_ts
 from armory.geo import GeoResolver, distance_miles
-from armory.models import ThreadRow
+from armory.models import Listing, ThreadRow
 from armory.roster import RosterIndex, normalize_make, normalize_model
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -359,10 +359,10 @@ def test_valuation_alerts_on_good_deal():
     db = _seed_valuation_db()
     llm = FakeLLM(_verdict(82))
     alerters = RecordingAlerters()
-    engine = ValuationEngine(db, llm, ValuationConfig(), search=FakeSearch(),
+    engine = ValuationEngine(db, llm, ValuationConfig(rate_per_minute=0), search=FakeSearch(),
                              roster=RosterIndex(db), alerters=alerters, radius_miles=100)
     stats = engine.run(limit=5)
-    assert stats == {"queued": 1, "valued": 1, "alerted": 0, "errors": 0}
+    assert stats == {"queued": 1, "valued": 1, "alerted": 1, "errors": 0}
     assert llm.loop_calls == 1
     assert len(alerters.sent) == 1
     sent = alerters.sent[0]
@@ -381,10 +381,42 @@ def test_valuation_no_alert_below_threshold_or_bad_verdict():
     for verdict in (_verdict(40, verdict="fair"), _verdict(95, verdict="overpriced")):
         db = _seed_valuation_db()
         alerters = RecordingAlerters()
-        engine = ValuationEngine(db, FakeLLM(verdict), ValuationConfig(), search=FakeSearch(),
+        engine = ValuationEngine(db, FakeLLM(verdict), ValuationConfig(rate_per_minute=0), search=FakeSearch(),
                                  roster=RosterIndex(db), alerters=alerters, radius_miles=100)
         engine.run(limit=5)
         assert not alerters.sent
+
+
+def test_valuation_pool_runs_concurrently():
+    import time as _time
+
+    from armory.config import ValuationConfig
+    from armory.valuation import ValuationEngine
+
+    class SlowLLM(FakeLLM):
+        def run_tool_loop(self, *a, **kw):
+            _time.sleep(0.5)
+            return super().run_tool_loop(*a, **kw)
+
+    db = Db(":memory:")
+    db.roster_load([("glock", "19", "on", "Glock", "19")])
+    rows = [now_row(str(i), title=f"WTS Glock 19 ${500 + i}") for i in range(5)]
+    db.upsert_threads("calguns", rows)
+    resolver = GeoResolver()
+    origin = resolver.origin("92122")
+    hit = resolver.resolve("El Cajon")
+    for r in rows:
+        db.set_geo("calguns", r.external_id, hit.lat, hit.lon,
+                   distance_miles(origin.lat, origin.lon, hit.lat, hit.lon), hit.quality,
+                   "El Cajon", None, None)
+    engine = ValuationEngine(db, SlowLLM(_verdict(60, verdict="fair")), ValuationConfig(rate_per_minute=0),
+                             search=FakeSearch(), radius_miles=100)
+    t0 = _time.time()
+    stats = engine.run(limit=5)
+    elapsed = _time.time() - t0
+    assert stats["valued"] == 5
+    # 5 × 0.5 s serial = 2.5 s; the pool must beat that comfortably
+    assert elapsed < 1.5, f"pool took {elapsed:.2f}s — not concurrent"
 
 
 def test_valuation_realert_only_on_price_drop():
@@ -393,7 +425,7 @@ def test_valuation_realert_only_on_price_drop():
 
     db = _seed_valuation_db()
     alerters = RecordingAlerters()
-    engine = ValuationEngine(db, FakeLLM(_verdict(80)), ValuationConfig(), search=FakeSearch(),
+    engine = ValuationEngine(db, FakeLLM(_verdict(80)), ValuationConfig(rate_per_minute=0), search=FakeSearch(),
                              roster=RosterIndex(db), alerters=alerters, radius_miles=100)
     engine.run(limit=5)
     assert len(alerters.sent) == 1
@@ -501,14 +533,16 @@ def test_engine_lazy_body_fetch():
             return "Full description " * 80, None
 
     llm = FakeLLM(_verdict(80))
-    engine = ValuationEngine(db, llm, ValuationConfig(), search=FakeSearch(),
+    engine = ValuationEngine(db, llm, ValuationConfig(rate_per_minute=0), search=FakeSearch(),
                              roster=None, alerters=None, radius_miles=100,
                              adapters={"calguns": BodyAdapter()})
     listing = db.valuation_queue(90, 100.0, gun_forums={"calguns": ["handguns"]})[0]
-    engine._ensure_body(listing)
-    assert fetched, "engine should fetch the full body for snippet-short rows"
-    assert len(listing["body"]) > 500
-    assert db.get_listing("calguns", "1")["body"] == listing["body"]
+    outcome = engine._work_one(listing)
+    assert fetched, "worker should fetch the full body for snippet-short rows"
+    assert outcome["body"] and len(outcome["body"][0]) > 500
+    # persistence is the main thread's job (SQLite stays single-threaded)
+    engine._finish_one(listing, None, outcome, {"queued": 1, "valued": 0, "alerted": 0, "errors": 0})
+    assert db.get_listing("calguns", "1")["body"] == outcome["body"][0]
 
 
 def test_ingest_thread_rows_end_to_end():
@@ -529,3 +563,21 @@ def test_ingest_thread_rows_end_to_end():
     assert laguna is not None
     assert laguna["geo_quality"] in ("place", "zip")
     assert laguna["distance_miles"] < 100
+
+
+def test_discord_embed_keeps_long_bodies():
+    from armory.alerts.discord import _embed
+
+    long_body = "attachment detail line\n" * 200  # ~4,600 chars
+    embed = _embed(Listing(
+        source="calguns", external_id="x", url="https://x",
+        title="WTS Glock 19 $600", price="$600", body=long_body,
+        matched_keywords=["glock"],
+    ))
+    desc = embed["description"]
+    # not the old 300-char preview: the body rides along up to Discord's
+    # limits (Discord's client collapses it behind "Show more")
+    assert len(desc) <= 3600
+    assert desc.count("attachment detail line") >= 150
+    total = len(embed["title"]) + len(desc) + len(embed["footer"]["text"])
+    assert total <= 6000
