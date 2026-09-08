@@ -99,6 +99,7 @@ class ValuationEngine:
         roster: RosterIndex | None = None,
         alerters=None,
         radius_miles: float = 100.0,
+        adapters: dict | None = None,   # for lazy full-body fetches per source
     ):
         self.db = db
         self.llm = llm
@@ -107,6 +108,12 @@ class ValuationEngine:
         self.search = search if (search and search.configured and cfg.web_search) else None
         self.roster = roster
         self.alerters = alerters
+        self.adapters = adapters or {}
+        # source → forum names that hold handguns (roster applies to these)
+        self.handgun_forums: dict[str, set[str]] = {
+            "calguns": {"handguns"},
+            "caguns": {"firearms"},
+        }
 
     # --- context building ---
 
@@ -135,11 +142,28 @@ class ValuationEngine:
                 listing[key] = getattr(probe, key)
 
     def _roster_hint(self, listing: dict) -> str:
-        if listing.get("forum") != "handguns":
+        if listing.get("forum") not in self.handgun_forums.get(listing.get("source", ""), set()):
             return "n/a (long gun — roster does not apply)"
         if self.roster is None or not listing.get("brand") or not listing.get("model"):
             return "unknown (no local roster data)"
         return self.roster.lookup(listing["brand"], listing["model"])
+
+    def _ensure_body(self, listing: dict, log=_log) -> None:
+        """Valuation context wants the FULL ad text; snippets are thin.
+        Fetch lazily here so only in-radius queue rows cost a request."""
+        adapter = self.adapters.get(listing.get("source", ""))
+        if adapter is None or not getattr(adapter, "thread_body", None):
+            return
+        body = listing.get("body") or ""
+        if body and len(body) >= 500:
+            return
+        try:
+            full, image_url = adapter.thread_body(listing["url"])
+        except Exception as exc:  # noqa: BLE001 — thin context beats no context
+            log(f"{listing['source']}: body fetch failed for {listing['external_id']}: {exc}")
+            return
+        self.db.set_body(listing["source"], listing["external_id"], full, image_url)
+        listing["body"] = full
 
     def _comps_block(self, listing: dict) -> str:
         if not listing.get("brand") or not listing.get("model"):
@@ -227,6 +251,7 @@ class ValuationEngine:
     def value_one(self, listing: dict, log=_log) -> dict:
         """Full valuation for one queue row. Returns the stored result dict."""
         self._ensure_identity(listing)
+        self._ensure_body(listing, log=log)
         previous = self.db.latest_valuation(listing["source"], listing["external_id"])
         tools = [WEB_SEARCH_TOOL] if self.search else []
         user = self._user_prompt(listing)
@@ -267,6 +292,7 @@ class ValuationEngine:
             window_days=self.cfg.eval_window_days,
             radius_miles=self.radius,
             limit=cap,
+            gun_forums=self.cfg.gun_forums,
         )
         stats = {"queued": len(queue), "valued": 0, "alerted": 0, "errors": 0}
         for listing in queue:

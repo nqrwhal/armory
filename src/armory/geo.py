@@ -88,20 +88,23 @@ class GeoResolver:
         if m and m.group(1) in self._zips:
             lat, lon = self._zips[m.group(1)]
             return GeoHit(lat, lon, "zip", m.group(1))
-        best: str | None = None
+        # longest match wins across places AND region terms, so
+        # "Inland Empire" beats the town of Empire and "San Diego Country
+        # Estates" beats San Diego
+        best: tuple[int, GeoHit] | None = None
         for pm in self._place_re.finditer(text):
-            if best is None or len(pm.group(1)) > len(best):
-                best = pm.group(1)
-        if best:
-            candidates = self._places[best.lower()]
-            # duplicate names across states: CA first (calguns is a CA site)
-            state, lat, lon = sorted(candidates, key=lambda c: c[0] != "CA")[0]
-            return GeoHit(lat, lon, "place", f"{best.title()}, {state}")
+            name = pm.group(1)
+            if best is None or len(name) > best[0]:
+                candidates = self._places[name.lower()]
+                # duplicate names across states: CA first (calguns is a CA site)
+                state, lat, lon = sorted(candidates, key=lambda c: c[0] != "CA")[0]
+                best = (len(name), GeoHit(lat, lon, "place", f"{name.title()}, {state}"))
         lower = text.lower()
         for term, (lat, lon) in REGIONS.items():
-            if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lower):
-                return GeoHit(lat, lon, "region", term)
-        return None
+            tm = re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lower)
+            if tm and (best is None or len(tm.group(0)) > best[0]):
+                best = (len(tm.group(0)), GeoHit(lat, lon, "region", term))
+        return best[1] if best else None
 
     def origin(self, zip_code: str) -> GeoHit:
         hit = self.resolve(zip_code)

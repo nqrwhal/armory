@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
 
-from ..models import HealthResult, Listing
+from ..models import HealthResult, Listing, ThreadRow
 from .base import AdapterError, SourceAdapter
 
 BASE = "https://caguns.net"
@@ -21,14 +21,27 @@ CATEGORY_PATHS: dict[str, str] = {
     "wtb": "/wtb",
     "shotguns": "/classifieds/categories/private-shotgun-listings.13/",
     "non_firearm": "/classifieds/categories/private-non-firearm-related-listings.11/",
-    "trade_pif": "/classifieds/categories/want-to-trade-pay-it-forward.12/",
+    "trade_pif": "/classifieds/categories/private-want-to-trade-pay-it-forward.12/",
     "barrels_uppers": "/classifieds/categories/barrels-complete-slides-uppers.14/",
-    "curio_relic": "/classifieds/categories/curio-relic.15/",
+    "curio_relic": "/classifieds/categories/private-curio-relic.15/",
 }
 
 _AD_ID_FROM_CLASS = re.compile(r"js-adListItem-(\d+)")
 _AD_URL = re.compile(r"^/classifieds/[a-z0-9-]+\.(\d+)/?$")
+_AD_TYPE_FROM_CLASS = re.compile(r"is-ad-type-([a-z_]+)")
 _PRICE = re.compile(r"\$\d[\d,]*(?:\.\d{2})?")
+_PRICE_NUM = re.compile(r"\$([\d,]+(?:\.\d{2})?)")
+_SOLD = re.compile(r"\b(sold|spf)\b", re.IGNORECASE)
+# live pages carry the ad type as a CSS class (?type= links are long gone)
+_AD_TYPE_TO_WANTS = {
+    "for_sale": "wts",
+    "for_trade": "wtt",
+    "wanted_to_buy": "wtb",
+    "wanted": "wtb",
+}
+_PREFIX_TO_WANTS = {"WTS": "wts", "WTB": "wtb", "WTT": "wtt"}
+# ad fields worth carrying into the body summary for the valuation LLM
+_PERSIST_FIELDS = ("Region", "Sub-Region", "Caliber", "Roster", "FFL Required Transfer", "Shipping", "Open to Trades")
 
 
 def _classify_block(html: str) -> str | None:
@@ -128,6 +141,117 @@ class CagunsAdapter(SourceAdapter):
             for page in range(1, max(1, pages) + 1):
                 listings.extend(self.parse_page(self._page(cat, page)))
         return listings
+
+    # --- deal pipeline: ThreadRows + full ad bodies ---
+
+    @staticmethod
+    def _fields(ad) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for row in ad.select("dl"):
+            dt = row.find("dt")
+            dd = row.find("dd")
+            if dt and dd:
+                fields[dt.get_text(" ", strip=True)] = dd.get_text(" ", strip=True)
+        return fields
+
+    def list_page(self, category: str, page: int = 1) -> list[ThreadRow]:
+        """One page of a category as ThreadRows (structured CAS fields included)."""
+        soup = BeautifulSoup(self._page(category, page), "html.parser")
+        rows: list[ThreadRow] = []
+        for ad in soup.select("div.structItem--ad"):
+            classes = " ".join(ad.get("class", []))
+            id_match = _AD_ID_FROM_CLASS.search(classes)
+            title_link = None
+            for a in ad.select(".structItem-title a[href]"):
+                if _AD_URL.match(a["href"].split("?")[0]):
+                    title_link = a
+                    break
+            if not id_match or title_link is None:
+                continue
+            title = title_link.get_text(" ", strip=True)
+            if not title:
+                continue
+            fields = self._fields(ad)
+            price_el = ad.find("span", string=_PRICE)
+            price = price_el.get_text(strip=True) if price_el else None
+            price_usd = None
+            if price:
+                m = _PRICE_NUM.search(price)
+                if m:
+                    price_usd = float(m.group(1).replace(",", ""))
+            # posted = first timestamp; the Updated field's own <time> = activity.
+            # Never fall back to times[1] — that's usually Expires (months out).
+            times = ad.find_all("time", attrs={"data-timestamp": True})
+            posted_at = datetime.fromtimestamp(int(times[0]["data-timestamp"]), tz=timezone.utc) if times else None
+            updated_dt = ad.find("dt", string=re.compile(r"^\s*Updated\s*$"))
+            updated_el = updated_dt.find_next("time", attrs={"data-timestamp": True}) if updated_dt else None
+            last_post_at = (
+                datetime.fromtimestamp(int(updated_el["data-timestamp"]), tz=timezone.utc)
+                if updated_el else posted_at
+            )
+            comments = fields.get("Comments", "0").split()[0].replace(",", "")
+            views = fields.get("Views", "0").split()[0].replace(",", "")
+            snippet_el = ad.select_one(".structItem-adDescription")
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            body_bits = [snippet] + [f"{k}: {fields[k]}" for k in _PERSIST_FIELDS if fields.get(k)]
+            prefix_link = ad.select_one("a[href*='/classifieds/?type=']")
+            wants_to = None
+            if prefix_link:
+                wants_to = _PREFIX_TO_WANTS.get(prefix_link.get_text(" ", strip=True).upper())
+            else:
+                type_match = _AD_TYPE_FROM_CLASS.search(classes)
+                wants_to = _AD_TYPE_TO_WANTS.get(type_match.group(1)) if type_match else None
+            location = " / ".join(f for f in (fields.get("Region"), fields.get("Sub-Region")) if f) or None
+            sold = bool(_SOLD.search(title)) or "sold" in (fields.get("Status") or "").lower()
+            rows.append(
+                ThreadRow(
+                    source=self.name,
+                    forum=category,
+                    external_id=id_match.group(1),
+                    url=BASE + title_link["href"].split("?")[0],
+                    title=title,
+                    author=ad.get("data-author"),
+                    posted_at=posted_at,
+                    last_post_at=last_post_at,
+                    replies=int(comments) if comments.isdigit() else 0,
+                    views=int(views) if views.isdigit() else 0,
+                    price=price,
+                    price_usd=price_usd,
+                    wants_to=wants_to,
+                    location=location,
+                    sold=sold,
+                    body="; ".join(b for b in body_bits if b)[:1500],
+                )
+            )
+        if not rows and page == 1:
+            # _page already rejects login walls/challenges; empty page 1 here
+            # means the ad-block markup itself changed
+            raise AdapterError("caguns: classifieds markup changed — no ad blocks parsed")
+        return rows
+
+    def thread_body(self, url: str) -> tuple[str, str | None]:
+        """Full ad description (first article.adBody-main) + first image."""
+        resp = self.fetcher.get(url)
+        if resp.status_code != 200:
+            raise AdapterError(f"caguns: ad page returned HTTP {resp.status_code}")
+        reason = _classify_block(resp.text)
+        if reason:
+            raise AdapterError(f"caguns: {reason}")
+        soup = BeautifulSoup(resp.text, "html.parser")
+        article = soup.select_one("article.adBody-main") or soup.select_one("article .message-body")
+        if article is None:
+            raise AdapterError("caguns: ad markup changed — no description block found")
+        text = re.sub(r"\s+", " ", article.get_text(" ", strip=True))
+        img = article.find("img", src=re.compile(r"^https?://"))
+        return text[:8000], img["src"] if img else None
+
+    def enrich(self, listing: Listing) -> None:
+        if not listing.url:
+            return
+        body, image_url = self.thread_body(listing.url)
+        listing.body = body
+        if image_url and not listing.image_url:
+            listing.image_url = image_url
 
     def health(self) -> HealthResult:
         try:

@@ -47,12 +47,20 @@ class ValuationConfig(BaseModel):
     max_per_cycle: int = 2        # valuations drained per watch cycle
     eval_window_days: int = 90    # only recently-active listings get valued
     sources: list[str] = Field(default_factory=lambda: ["calguns"])
+    # source → its gun categories (queue filter + handgun/roster detection)
+    gun_forums: dict[str, list[str]] = Field(default_factory=lambda: {
+        "calguns": ["handguns", "long_guns"],
+    })
 
 
 class BackfillConfig(BaseModel):
     days: int = 90
-    request_interval: float = 1.5  # seconds between calguns fetches (+jitter)
-    forums: list[str] = Field(default_factory=lambda: ["handguns", "long_guns"])
+    # per-source fetch pacing — caguns is deliberately slower (anti-scraper site)
+    intervals: dict[str, float] = Field(default_factory=lambda: {"calguns": 1.5})
+    # source → categories to walk
+    forums: dict[str, list[str]] = Field(default_factory=lambda: {
+        "calguns": ["handguns", "long_guns"],
+    })
 
 
 class DbConfig(BaseModel):

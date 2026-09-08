@@ -100,29 +100,36 @@ to LLM rules too.
 - Edits/bumps don't re-alert (same listing ID = already seen). Nothing is stored
   per listing — after the ID leaves the ring, only the timestamp cutoff applies.
 
-## Deal hunter (calguns → 92122 radius)
+## Deal hunter (calguns + caguns → 92122 radius)
 
-On top of keyword alerts, armory continuously parses the calguns marketplace
-(handguns + long guns), keeps every listing in SQLite (`armory.db`), and runs
-an AI valuation on anything for sale within `watch.radius_miles` of
-`watch.zip` (default: 100 mi around 92122 / UTC San Diego):
+On top of keyword alerts, armory continuously parses the calguns and caguns
+marketplaces (handguns + long guns categories per `valuation.gun_forums`),
+keeps every listing in SQLite (`armory.db`), and runs an AI valuation on
+anything for sale within `watch.radius_miles` of `watch.zip` (default:
+100 mi around 92122 / UTC San Diego):
 
 ```
-thread lists ─→ armory.db ─→ geo (zip → city → region; body fallback)
-                           ─→ CA roster lookup (deterministic, fuzzy)
-                           ─→ GLM-5.3-Flash valuation:
-                                thinking ON + web_search tool (z.ai MCP),
-                                local comps from the DB, attachment pricing,
-                                off-roster premium → deal score 0-100
-                           ─→ Discord/iMessage alert at score ≥ 70
+thread/ad lists ─→ armory.db ─→ geo (zip → city/region, longest match wins;
+                                 caguns Region/Sub-Region resolves structurally)
+                              ─→ CA roster lookup (deterministic, fuzzy)
+                              ─→ GLM-5.3-Flash valuation:
+                                   thinking ON + web_search tool (z.ai MCP),
+                                   local comps from the DB, attachment pricing,
+                                   off-roster premium → deal score 0-100
+                              ─→ Discord/iMessage alert at score ≥ 70
 ```
 
-- **Backfill** (`armory backfill`) walks the thread lists newest→oldest until
-  everything older than `backfill.days` (90) has been seen, fetching first-post
-  bodies only when the title hides the price/location (~half of them). It is
-  throttled (~1.5 s/request + jitter), resumable (Ctrl-C and re-run), and
-  builds the historical comps the valuations lean on. A full 90-day run is a
-  couple of hours; `--pages N` bounds a session.
+caguns CAS ads arrive with structured fields (price, Region/Sub-Region,
+Caliber, and the site's own Roster tag) that flow straight into the DB and the
+valuation context; calguns titles get the regex treatment with lazy body
+fetches when they hide price/location. Full ad bodies are fetched lazily at
+valuation time so only in-radius queue rows cost a request.
+
+- **Backfill** (`armory backfill [--source calguns|caguns|all]`) walks the
+  lists newest→oldest until everything older than `backfill.days` (90) has
+  been seen, throttled per source (`backfill.intervals`; caguns runs slower
+  on purpose — the site is explicitly anti-scraper) and resumable
+  (Ctrl-C and re-run). It builds the historical comps the valuations lean on.
 - **Live** — every `armory watch` cycle also ingests page 1 of each gun forum
   (catching new threads, price edits, and SOLD edits) and drains a couple of
   valuations (`valuation.max_per_cycle`), so new listings are valued as they
@@ -148,7 +155,8 @@ thread lists ─→ armory.db ─→ geo (zip → city → region; body fallback
   data keeps feeding comps after pruning.
 - Geo resolution is honest about fuzziness: zips and cities resolve exactly;
   "SoCal"/"NorCal"-style region tags resolve to a centroid and are tagged as
-  approximate; listings with no resolvable location are stored but never
+  approximate (longest match wins, so "Inland Empire" is the region, not the
+  town of Empire); listings with no resolvable location are stored but never
   valued or alerted on.
 
 ## Alert etiquette

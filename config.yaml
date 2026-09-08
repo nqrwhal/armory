@@ -29,12 +29,19 @@ valuation:
   alert_min_score: 70      # alert at/above this deal score (0-100)
   max_per_cycle: 2         # valuations per watch cycle (latency-tolerant)
   eval_window_days: 90     # only recently-active listings get valued
-  sources: [calguns]
+  sources: [calguns, caguns]
+  gun_forums:              # source → its gun categories
+    calguns: [handguns, long_guns]
+    caguns: [firearms, longguns]
 
 backfill:
-  days: 90                 # how deep the one-time calguns walk goes
-  request_interval: 1.5    # seconds between calguns fetches (+jitter)
-  forums: [handguns, long_guns]
+  days: 90                 # how deep the one-time walk goes per forum
+  intervals:               # seconds between fetches (+jitter); caguns stays slow
+    calguns: 1.5
+    caguns: 3.0
+  forums:                  # source → categories to walk
+    calguns: [handguns, long_guns]
+    caguns: [firearms, longguns]
 
 sources:
   calguns:

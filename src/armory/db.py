@@ -149,7 +149,7 @@ class Db:
         A changed title on an existing thread usually means a price edit or a
         SOLD marker — the caller re-runs title parsing for those.
         """
-        from .adapters.calguns import parse_title  # local import: adapters depend on models only
+        from .adapters.calguns import parse_title  # title conventions, used as the fallback
 
         now = utcnow_iso()
         result = UpsertResult(new=[], changed=[])
@@ -162,19 +162,23 @@ class Db:
                 ).fetchone()
                 if existing is None:
                     parsed = parse_title(row.title)
-                    status = "sold" if parsed["sold"] else ("open" if row.last_post_at else "unknown")
+                    price_usd = row.price_usd if row.price_usd is not None else parsed["price_usd"]
+                    price = row.price or (f"${price_usd:g}" if price_usd else None)
+                    wants_to = row.wants_to or parsed["wants_to"]
+                    sold = row.sold or parsed["sold"]
+                    status = "sold" if sold else ("open" if row.last_post_at else "unknown")
                     self.conn.execute(
                         """INSERT INTO listings (source, external_id, url, title, price, price_usd,
                              forum, author, posted_at, last_post_at, replies, views, wants_to, status,
-                             first_seen, last_seen, needs_enrich)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                             location_raw, body, first_seen, last_seen, needs_enrich)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            source, row.external_id, row.url, row.title,
-                            f"${parsed['price_usd']:g}" if parsed["price_usd"] else None,
-                            parsed["price_usd"], row.forum, row.author,
+                            source, row.external_id, row.url, row.title, price, price_usd,
+                            row.forum, row.author,
                             sql_ts(row.posted_at), sql_ts(row.last_post_at),
-                            row.replies, row.views, parsed["wants_to"], status, now, now,
-                            1 if parsed["price_usd"] is None else 0,
+                            row.replies, row.views, wants_to, status,
+                            row.location, row.body or None, now, now,
+                            1 if price_usd is None else 0,
                         ),
                     )
                     result.new.append(dict(source=source, external_id=row.external_id, title=row.title, forum=row.forum))
@@ -182,7 +186,8 @@ class Db:
                     changed = existing["title"] != row.title or (row.author and existing["author"] != row.author)
                     if changed:
                         parsed = parse_title(row.title)
-                        if parsed["sold"]:
+                        price_usd = row.price_usd if row.price_usd is not None else parsed["price_usd"]
+                        if row.sold or parsed["sold"]:
                             status = "sold"
                         elif existing["status"] == "sold":
                             status = "sold"  # SOLD edits are not reliably undone; leave it
@@ -194,9 +199,9 @@ class Db:
                                  posted_at=COALESCE(posted_at, ?)
                                WHERE source=? AND external_id=?""",
                             (
-                                row.title, row.author, parsed["price_usd"],
-                                f"${parsed['price_usd']:g}" if parsed["price_usd"] else None,
-                                parsed["wants_to"] or existing["wants_to"], status, row.url,
+                                row.title, row.author, price_usd,
+                                row.price or (f"${price_usd:g}" if price_usd else None),
+                                row.wants_to or parsed["wants_to"] or existing["wants_to"], status, row.url,
                                 sql_ts(row.posted_at),
                                 source, row.external_id,
                             ),
@@ -204,12 +209,14 @@ class Db:
                         result.changed.append(dict(source=source, external_id=row.external_id, title=row.title, forum=row.forum))
                     self.conn.execute(
                         """UPDATE listings SET last_seen=?, last_post_at=COALESCE(?, last_post_at),
-                             replies=MAX(replies, ?), views=MAX(views, ?)
+                             replies=MAX(replies, ?), views=MAX(views, ?),
+                             location_raw=COALESCE(location_raw, ?)
                            WHERE source=? AND external_id=?""",
                         (
                             now,
                             sql_ts(row.last_post_at),
-                            row.replies, row.views, source, row.external_id,
+                            row.replies, row.views, row.location,
+                            source, row.external_id,
                         ),
                     )
             self.conn.commit()
@@ -269,16 +276,25 @@ class Db:
     # --- valuation queue ---
 
     def valuation_queue(self, window_days: int, radius_miles: float, limit: int = 20,
-                        forums: list[str] | None = None) -> list[dict]:
+                        gun_forums: dict[str, list[str]] | None = None) -> list[dict]:
         """In-radius, for-sale, recently-active gun listings needing (re)valuation.
 
-        A listing re-enters the queue when its asking price moved >5% from the
-        latest valuation — a price drop is exactly when a fresh opinion matters.
+        gun_forums maps source → its gun categories (e.g. calguns→handguns,
+        caguns→firearms). A listing re-enters the queue when its asking price
+        moved >5% from the latest valuation — a price drop is exactly when a
+        fresh opinion matters.
         """
-        gun_forums = forums or ["handguns", "long_guns"]
+        forums_map = gun_forums or {"calguns": ["handguns", "long_guns"]}
         # distance must filter in SQL: a Python-side filter after LIMIT would
         # starve in-radius rows — the newest-active threads are mostly
         # out-of-radius statewide listings
+        pairs, forum_args = [], []
+        for src, forums in forums_map.items():
+            placeholders = ", ".join("?" * len(forums))
+            pairs.append(f"(l.source = ? AND l.forum IN ({placeholders}))")
+            forum_args.append(src)
+            forum_args.extend(forums)
+        forum_where = " OR ".join(pairs)
         q = f"""
         SELECT l.*, v.asking_price AS last_ask, v.id AS last_val_id, v.alerted_at
           FROM listings l
@@ -286,7 +302,7 @@ class Db:
             ON v.source = l.source AND v.external_id = l.external_id
            AND v.id = (SELECT MAX(id) FROM valuations v2
                         WHERE v2.source = l.source AND v2.external_id = l.external_id)
-         WHERE l.forum IN ({",".join("?" * len(gun_forums))})
+         WHERE ({forum_where})
            AND l.wants_to = 'wts'
            AND l.status = 'open'
            AND l.price_usd IS NOT NULL
@@ -299,7 +315,7 @@ class Db:
            )
          ORDER BY {_QUEUE_FRESH} DESC
          LIMIT ?"""
-        args = [*gun_forums, radius_miles, f"-{window_days} days", limit]
+        args = [*forum_args, radius_miles, f"-{window_days} days", limit]
         return [dict(r) for r in self.conn.execute(q, args).fetchall()]
 
     def insert_valuation(self, source: str, external_id: str, result: dict, model_used: str) -> int:

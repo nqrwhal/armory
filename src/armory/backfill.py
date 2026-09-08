@@ -46,10 +46,11 @@ def run_backfill(
     days: int = 90,
     pages_limit: int = 0,          # 0 = no cap
     body_cap_per_page: int = 60,   # ~half of calguns titles hide the price
-    throttle: float = 1.5,
+    throttle: float | None = None,
     log=_log,
 ) -> dict:
     cutoff = _cutoff(days)
+    throttle = 1.5 if throttle is None else throttle
     stats = {"pages": 0, "rows": 0, "new": 0, "changed": 0, "bodies": 0, "geo": 0, "done_forums": []}
     for forum in forums:
         progress = db.backfill_progress(forum)

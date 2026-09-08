@@ -35,6 +35,11 @@ def _apply_geo(db: Db, resolver: GeoResolver, origin: GeoHit, source: str, exter
     return False
 
 
+def _geo_texts(row: dict) -> tuple[str, ...]:
+    """Resolution order: structured location (caguns Region) → title → body."""
+    return (row.get("location_raw") or "", row.get("title") or "", row.get("body") or "")
+
+
 def _extract_price(body: str) -> float | None:
     from .adapters.calguns import _PRICE
 
@@ -65,15 +70,15 @@ def ingest_thread_rows(
     stats["new"] = len(result.new)
     stats["changed"] = len(result.changed)
 
-    # resolve from the title first — free, no requests
+    # resolve from structured location / title first — free, no requests
     want_body: list[dict] = []
     for item in result.new + result.changed:
         row = db.get_listing(item["source"], item["external_id"])
         if row is None:
             continue
-        if _apply_geo(db, resolver, origin, row["source"], row["external_id"], row["title"], row["body"] or ""):
+        if _apply_geo(db, resolver, origin, row["source"], row["external_id"], *_geo_texts(row)):
             stats["geo"] += 1
-        # title hid the price, or the location didn't resolve → need the body
+        # price or location still hidden → the body may carry them
         if row["needs_enrich"] or row["geo_quality"] is None:
             if not row["body"]:
                 want_body.append(row)
@@ -103,7 +108,8 @@ def ingest_thread_rows(
                     (price, f"${price:g}", row["source"], row["external_id"]),
                 )
                 db.conn.commit()
-        if _apply_geo(db, resolver, origin, row["source"], row["external_id"], row["title"], body):
+        if _apply_geo(db, resolver, origin, row["source"], row["external_id"],
+                      row.get("location_raw") or "", row["title"], body):
             stats["geo"] += 1
         elif not price:
             stats["geo_failed"] += 1
@@ -152,20 +158,25 @@ class DealContext:
     so poll_source can stay adapter-shaped: ingest new forum rows, then drain
     a couple of valuations per cycle."""
 
-    def __init__(self, cfg, db: Db, resolver: GeoResolver, origin: GeoHit, engine, forums: list[str]):
+    def __init__(self, cfg, db: Db, resolver: GeoResolver, origin: GeoHit, engine,
+                 forums: dict[str, list[str]], adapters: dict | None = None):
         self.cfg = cfg
         self.db = db
         self.resolver = resolver
         self.origin = origin
         self.engine = engine
-        self.forums = forums
+        self.forums = forums  # source → gun categories to ingest
+        self.adapters = adapters or {}
+
+    def _throttle(self, source: str) -> float:
+        return self.cfg.backfill.intervals.get(source, 1.5)
 
     def ingest(self, adapter, log=_log) -> dict | None:
         """Page 1 of each gun forum — catches new/sold/edited threads."""
         if not hasattr(adapter, "list_page"):
             return None
         stats = None
-        for forum in self.forums:
+        for forum in self.forums.get(adapter.name, []):
             try:
                 rows = adapter.list_page(forum, 1)
             except AdapterError as exc:
@@ -173,7 +184,7 @@ class DealContext:
                 continue
             stats = ingest_thread_rows(
                 adapter, self.db, rows, self.resolver, self.origin,
-                body_cap=8, throttle=self.cfg.backfill.request_interval, log=log,
+                body_cap=8, throttle=self._throttle(adapter.name), log=log,
             )
         return stats
 

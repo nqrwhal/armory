@@ -98,11 +98,12 @@ class HealthResult:
 
 @dataclass(slots=True)
 class ThreadRow:
-    """One thread from a forum list page (calguns backfill/live ingest).
+    """One thread/ad from a forum list page (backfill + live ingest).
 
-    Carries the metadata the thread list gives us for free; the first-post
-    body is fetched lazily only for threads that need it (valuation, or a
-    title that hides price/location).
+    Carries the metadata the thread list gives us for free; sources with
+    structured ads (caguns CAS) fill price/wants_to/location/body directly,
+    while title-convention sources (calguns) leave them for title parsing.
+    The full body is fetched lazily for threads that need it.
     """
 
     source: str
@@ -115,6 +116,13 @@ class ThreadRow:
     last_post_at: datetime | None = None  # last activity (bumps refresh this)
     replies: int = 0
     views: int = 0
+    # structured extras (optional — source-dependent)
+    price: str | None = None
+    price_usd: float | None = None
+    wants_to: str | None = None
+    location: str | None = None  # raw location text ("SoCal / Los Angeles")
+    sold: bool = False
+    body: str = ""  # short snippet/field summary; full body fetched lazily
 
     def to_listing(self) -> Listing:
         return Listing(

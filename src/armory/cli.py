@@ -42,7 +42,7 @@ def _state(cfg) -> StateStore:
     return state
 
 
-def _deal_boot(cfg, llm):
+def _deal_boot(cfg, llm, adapters: dict | None = None):
     """DB + geo + roster + search + valuation engine, or None when disabled."""
     if not cfg.valuation.enabled:
         return None
@@ -71,8 +71,10 @@ def _deal_boot(cfg, llm):
         engine = ValuationEngine(
             db, llm, cfg.valuation, search=search, roster=roster,
             alerters=Alerters(cfg.alerts), radius_miles=cfg.watch.radius_miles,
+            adapters=adapters or {},
         )
-    return DealContext(cfg, db, resolver, origin, engine, forums=cfg.backfill.forums)
+    return DealContext(cfg, db, resolver, origin, engine,
+                       forums=cfg.backfill.forums, adapters=adapters or {})
 
 
 @app.command(name="watch")
@@ -85,7 +87,7 @@ def watch_cmd(
         console.print("[red]no enabled sources — check config.yaml and .env[/red]")
         raise typer.Exit(1)
     state = _state(cfg)
-    deal_ctx = _deal_boot(cfg, llm)
+    deal_ctx = _deal_boot(cfg, llm, adapters)
     intervals = {name: cfg.sources[name].poll_interval for name in adapters}
     watch(
         state, adapters, alerters, intervals, llm=llm,
@@ -107,7 +109,7 @@ def poll(
         console.print(f"[red]unknown/disabled source '{source}' (available: {', '.join(adapters)})[/red]")
         raise typer.Exit(1)
     state = _state(cfg)
-    deal_ctx = _deal_boot(cfg, llm)
+    deal_ctx = _deal_boot(cfg, llm, adapters)
     ok = run_poll_cycle(state, adapters, alerters, llm=llm, only=source,
                         max_alerts=cfg.alerts.max_per_cycle, deal_ctx=deal_ctx)
     raise typer.Exit(0 if ok else 1)
@@ -154,10 +156,11 @@ def status(config: str = typer.Option(None, "--config", "-c")):
             f"{counts['roster']} roster rows, {counts['comps_archive']} archived comps "
             f"({size / 1e6:.1f} MB)[/dim]"
         )
-        for forum in cfg.backfill.forums:
-            p = db.backfill_progress(forum)
-            state_txt = "done" if p["done"] else f"page {p['pages_done']}"
-            console.print(f"[dim]backfill {forum}: {state_txt}[/dim]")
+        for src, forums in cfg.backfill.forums.items():
+            for forum in forums:
+                p = db.backfill_progress(forum)
+                state_txt = "done" if p["done"] else f"page {p['pages_done']}"
+                console.print(f"[dim]backfill {src}/{forum}: {state_txt}[/dim]")
 
 
 # --- deal hunter: backfill / evaluate / deals / roster ---
@@ -165,40 +168,43 @@ def status(config: str = typer.Option(None, "--config", "-c")):
 
 @app.command()
 def backfill(
-    forum: str = typer.Option("all", "--forum", "-f", help="handguns | long_guns | all"),
+    source: str = typer.Option("all", "--source", "-s", help="calguns | caguns | all"),
+    forum: str = typer.Option("all", "--forum", "-f", help="One category, or all"),
     days: int = typer.Option(None, "--days", help="Cutoff age in days (default: config)"),
     pages: int = typer.Option(0, "--pages", help="Stop after N pages this run (0 = no cap)"),
     enrich_limit: int = typer.Option(0, "--enrich", help="Extra body-fetch pass for N deferred rows"),
     config: str = typer.Option(None, "--config", "-c"),
 ):
-    """Walk calguns marketplace thread lists into the DB (resumable, throttled)."""
+    """Walk marketplace thread lists into the DB (resumable, throttled)."""
     from .backfill import run_backfill, run_enrich_backlog
 
     cfg, adapters, _, _ = _boot(config)
-    if "calguns" not in adapters:
-        console.print("[red]calguns source not enabled[/red]")
-        raise typer.Exit(1)
-    forums = cfg.backfill.forums if forum == "all" else [forum]
-    deal_ctx = _deal_boot(cfg, None)
+    deal_ctx = _deal_boot(cfg, None, adapters)
     if deal_ctx is None:
         console.print("[red]valuation disabled in config.yaml — backfill needs it for geo[/red]")
         raise typer.Exit(1)
-    stats = run_backfill(
-        adapters["calguns"], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin, forums,
-        days=days or cfg.backfill.days, pages_limit=pages,
-        throttle=cfg.backfill.request_interval,
-    )
-    console.print(
-        f"[green]backfill:[/green] {stats['pages']} pages, {stats['new']} new rows, "
-        f"{stats['bodies']} bodies, {stats['geo']} geo-located"
-        + (f" (cutoff reached: {', '.join(stats['done_forums'])})" if stats["done_forums"] else "")
-    )
-    if enrich_limit:
-        done = run_enrich_backlog(
-            adapters["calguns"], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin,
-            cap=enrich_limit, throttle=cfg.backfill.request_interval,
+    wanted = [source] if source != "all" else list(cfg.backfill.forums)
+    for src in wanted:
+        if src not in adapters:
+            console.print(f"[yellow]{src}: source not enabled — skipped[/yellow]")
+            continue
+        forums = cfg.backfill.forums.get(src, []) if forum == "all" else [forum]
+        throttle = cfg.backfill.intervals.get(src, 1.5)
+        stats = run_backfill(
+            adapters[src], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin, forums,
+            days=days or cfg.backfill.days, pages_limit=pages, throttle=throttle,
         )
-        console.print(f"[green]enrich pass:[/green] {done} bodies fetched")
+        console.print(
+            f"[green]{src} backfill:[/green] {stats['pages']} pages, {stats['new']} new rows, "
+            f"{stats['bodies']} bodies, {stats['geo']} geo-located"
+            + (f" (cutoff reached: {', '.join(stats['done_forums'])})" if stats["done_forums"] else "")
+        )
+        if enrich_limit:
+            done = run_enrich_backlog(
+                adapters[src], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin,
+                cap=enrich_limit, throttle=throttle,
+            )
+            console.print(f"[green]{src} enrich pass:[/green] {done} bodies fetched")
 
 
 @app.command()
@@ -208,11 +214,11 @@ def evaluate(
     config: str = typer.Option(None, "--config", "-c"),
 ):
     """Run the LLM valuation (thinking + web search) over the deal queue."""
-    cfg, _, _, llm = _boot(config)
+    cfg, adapters, _, llm = _boot(config)
     if llm is None or not llm.configured:
         console.print("[red]LLM_API_KEY not set — valuation needs it[/red]")
         raise typer.Exit(1)
-    deal_ctx = _deal_boot(cfg, llm)
+    deal_ctx = _deal_boot(cfg, llm, adapters)
     if deal_ctx is None or deal_ctx.engine is None:
         console.print("[red]valuation disabled in config.yaml[/red]")
         raise typer.Exit(1)

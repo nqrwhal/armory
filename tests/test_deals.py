@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -406,7 +407,108 @@ def test_valuation_realert_only_on_price_drop():
     assert len(alerters.sent) == 2
 
 
-# --- pipeline ingest ---
+# --- caguns deal pipeline ---
+
+
+class CagunsFakeFetcher:
+    def get(self, url, params=None, retries=2, timeout=30.0):
+        # ad URLs look like /classifieds/{slug}.{id}/; category pages don't
+        if "/classifieds/" in url and re.search(r"\.\d+/?(?:\?|$)", url):
+            return FakeResp((FIXTURES / "caguns_ad_page.html").read_text())
+        return FakeResp((FIXTURES / "caguns_firearms_page.html").read_text())
+
+
+def test_caguns_list_page_structured_rows():
+    from armory.adapters.caguns import CagunsAdapter
+
+    ad = CagunsAdapter(SourceConfig(), CagunsFakeFetcher())
+    rows = ad.list_page("firearms", 1)
+    assert len(rows) == 20
+    first = rows[0]
+    assert first.source == "caguns" and first.forum == "firearms"
+    assert first.price_usd == 2500.0 and first.wants_to == "wts"
+    assert first.location == "SoCal / Los Angeles"
+    assert first.last_post_at >= first.posted_at
+    assert first.last_post_at is not None
+    assert "Roster: Off Roster" in first.body  # structured fields ride along for the LLM
+
+
+def test_caguns_thread_body_full_description():
+    from armory.adapters.caguns import CagunsAdapter
+
+    ad = CagunsAdapter(SourceConfig(), CagunsFakeFetcher())
+    body, img = ad.thread_body("https://caguns.net/classifieds/x.54871/")
+    assert "CZ Tactical Sport" in body
+    assert len(body) > 400  # full description, not the snippet
+    assert img and img.startswith("https://")
+
+
+def test_upsert_structured_row_and_multisource_queue():
+    from armory.adapters.caguns import CagunsAdapter
+
+    adapter = CagunsAdapter(SourceConfig(), CagunsFakeFetcher())
+    rows = adapter.list_page("firearms", 1)
+    db = Db(":memory:")
+    result = db.upsert_threads("caguns", rows)
+    assert len(result.new) == 20
+    row = db.get_listing("caguns", rows[0].external_id)
+    assert row["price_usd"] == 2500.0
+    assert row["wants_to"] == "wts"
+    assert row["location_raw"] == "SoCal / Los Angeles"
+    assert row["body"] and "Roster" in row["body"]
+
+    # geo from Region/Sub-Region, then queue with the caguns forum mapping
+    resolver = GeoResolver()
+    origin = resolver.origin("92122")
+    for r in rows:
+        listing = db.get_listing("caguns", r.external_id)
+        hit = resolver.resolve(listing["location_raw"] or "")
+        if hit:
+            db.set_geo("caguns", r.external_id, hit.lat, hit.lon,
+                       distance_miles(origin.lat, origin.lon, hit.lat, hit.lon), hit.quality,
+                       hit.label.split(",")[0], None, None)
+    queue = db.valuation_queue(90, 100.0, gun_forums={"caguns": ["firearms"]})
+    ids = {q["external_id"] for q in queue}
+    # San Diego sub-region rows are well inside the radius
+    sd = [r for r in rows if r.location and "San Diego" in r.location]
+    assert sd and all(r.external_id in ids for r in sd)
+    # NorCal rows resolve far outside and must not be queued
+    norcal = [r for r in rows if r.location and "NorCal" in r.location]
+    assert norcal and all(r.external_id not in ids for r in norcal)
+    # "Inland Empire" must resolve to the region, not the town of Empire
+    ie = [r for r in rows if r.location and "Inland Empire" in r.location]
+    if ie:
+        hit = resolver.resolve(ie[0].location)
+        assert hit.quality == "region" and hit.label == "inland empire"
+
+
+def test_engine_lazy_body_fetch():
+    from armory.config import ValuationConfig
+    from armory.valuation import ValuationEngine
+
+    db = _seed_valuation_db()
+    db.conn.execute(
+        "UPDATE listings SET body='short snippet' WHERE source='calguns' AND external_id='1'"
+    )
+    db.conn.commit()
+    fetched = []
+
+    class BodyAdapter:
+        name = "calguns"
+
+        def thread_body(self, url):
+            fetched.append(url)
+            return "Full description " * 80, None
+
+    llm = FakeLLM(_verdict(80))
+    engine = ValuationEngine(db, llm, ValuationConfig(), search=FakeSearch(),
+                             roster=None, alerters=None, radius_miles=100,
+                             adapters={"calguns": BodyAdapter()})
+    listing = db.valuation_queue(90, 100.0, gun_forums={"calguns": ["handguns"]})[0]
+    engine._ensure_body(listing)
+    assert fetched, "engine should fetch the full body for snippet-short rows"
+    assert len(listing["body"]) > 500
+    assert db.get_listing("calguns", "1")["body"] == listing["body"]
 
 
 def test_ingest_thread_rows_end_to_end():
