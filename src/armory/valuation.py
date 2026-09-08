@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from .config import ValuationConfig
 from .db import Db
@@ -94,6 +95,15 @@ def _log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def load_law_playbook() -> str | None:
+    """The CA transfer-law reference shipped in the package data dir."""
+    path = Path(__file__).parent / "data" / "ca_transfer_laws.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def _f(value, default=None):
     try:
         return float(value)
@@ -126,6 +136,17 @@ class ValuationEngine:
             "calguns": {"handguns"},
             "caguns": {"firearms"},
         }
+        self._system = VALUATION_SYSTEM
+        if cfg.law_playbook:
+            playbook = load_law_playbook()
+            if playbook:
+                self._system = (
+                    VALUATION_SYSTEM
+                    + "\n\nAPPENDIX — CALIFORNIA TRANSFER LAW PLAYBOOK (current as of its own\n"
+                    "date stamp; authoritative for transfer fees, purchase limits, roster and\n"
+                    "magazine rules — use its exact numbers, never guess transfer costs, and add\n"
+                    "caveats for anything it flags):\n\n" + playbook
+                )
 
     # --- context building ---
 
@@ -284,7 +305,7 @@ class ValuationEngine:
             tools = [WEB_SEARCH_TOOL] if self.search else []
             user = self._user_prompt(listing)
             reply = self.llm.run_tool_loop(
-                VALUATION_SYSTEM, user, tools, self._executor,
+                self._system, user, tools, self._executor,
                 model=self.cfg.model, thinking="on" if self.cfg.thinking else "disabled",
             )
             v = extract_json(reply)

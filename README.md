@@ -145,6 +145,13 @@ valuation time so only in-radius queue rows cost a request.
 - **Roster** — `armory roster refresh` fetches the DOJ certified + de-certified
   handgun tables (~3.7k entries) into the DB. Long guns skip roster logic
   (handgun-only law).
+- **Law playbook** — `src/armory/data/ca_transfer_laws.md` (researched, dated,
+  sourced) is appended to every valuation prompt while
+  `valuation.law_playbook` is on: exact PPT/DROS fees ($47.19 + $10/extra
+  gun), the 3-per-30-days purchase cap (AB 1078, post-*Rhodes*), C&R/FFL03+COE
+  rules, the >10-round magazine ban, waiting period, interstate restrictions,
+  and how each should move the deal score. Update it when laws change — the
+  model treats it as authoritative over its own memory.
 - **Web search** — the model's `web_search` tool runs through z.ai's web-search
   MCP server (`https://api.z.ai/api/mcp/web_search_prime/mcp`, same
   `LLM_API_KEY`, Bearer auth). If it's unreachable the valuation degrades to

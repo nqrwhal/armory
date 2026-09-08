@@ -559,6 +559,35 @@ def test_valuation_per_item_without_total_falls_back_to_unit_price():
     assert v["asking_price"] == 770.0 and v["asking_total"] == 770.0
 
 
+def test_law_playbook_injected_into_valuation_prompt():
+    from armory.config import ValuationConfig
+    from armory.valuation import ValuationEngine, load_law_playbook
+
+    playbook = load_law_playbook()
+    assert playbook and "47.19" in playbook and "AB 1078" in playbook
+
+    seen = {}
+
+    class SystemCaptureLLM(FakeLLM):
+        def run_tool_loop(self, system, user, tools, executor, **kw):
+            seen["system"] = system
+            seen["user"] = user
+            return super().run_tool_loop(system, user, tools, executor, **kw)
+
+    db = _seed_valuation_db()
+    engine = ValuationEngine(db, SystemCaptureLLM(_verdict(80, verdict="fair")),
+                             ValuationConfig(rate_per_minute=0), search=FakeSearch(), radius_miles=100)
+    engine._work_one(db.valuation_queue(90, 100.0)[0])
+    assert "APPENDIX — CALIFORNIA TRANSFER LAW PLAYBOOK" in seen["system"]
+    assert "$47.19" in seen["system"]
+
+    engine_off = ValuationEngine(db, SystemCaptureLLM(_verdict(80)), ValuationConfig(rate_per_minute=0, law_playbook=False),
+                                  search=FakeSearch(), radius_miles=100)
+    seen.clear()
+    engine_off._work_one(db.valuation_queue(90, 100.0)[0])
+    assert "APPENDIX" not in seen["system"]
+
+
 def test_engine_lazy_body_fetch():
     from armory.config import ValuationConfig
     from armory.valuation import ValuationEngine

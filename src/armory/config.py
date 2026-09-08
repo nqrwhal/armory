@@ -50,6 +50,7 @@ class ValuationConfig(BaseModel):
     max_concurrent: int = 10
     max_per_cycle: int = 5        # queue rows drained per run()/watch cycle
     eval_window_days: int = 90    # only recently-active listings get valued
+    law_playbook: bool = True     # append data/ca_transfer_laws.md to the prompt
     sources: list[str] = Field(default_factory=lambda: ["calguns"])
     # source → its gun categories (queue filter + handgun/roster detection)
     gun_forums: dict[str, list[str]] = Field(default_factory=lambda: {

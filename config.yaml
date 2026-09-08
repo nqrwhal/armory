@@ -31,6 +31,7 @@ valuation:
   max_concurrent: 10       # throughput needs parallel workers
   max_per_cycle: 5         # queue rows drained per run()/watch cycle
   eval_window_days: 90     # only recently-active listings get valued
+  law_playbook: true       # append data/ca_transfer_laws.md to the prompt
   sources: [calguns, caguns]
   gun_forums:              # source → its gun categories
     calguns: [handguns, long_guns]
