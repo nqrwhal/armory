@@ -42,6 +42,39 @@ def _state(cfg) -> StateStore:
     return state
 
 
+def _deal_boot(cfg, llm):
+    """DB + geo + roster + search + valuation engine, or None when disabled."""
+    if not cfg.valuation.enabled:
+        return None
+    from .db import Db
+    from .geo import GeoResolver
+    from .pipeline import DealContext
+    from .roster import RosterIndex
+
+    db = Db(cfg.db.path)
+    resolver = GeoResolver()
+    origin = resolver.origin(cfg.watch.zip)
+    engine = None
+    if llm is not None and llm.configured:
+        from .valuation import ValuationEngine
+
+        if secret("VALUATION_MODEL"):
+            cfg.valuation.model = secret("VALUATION_MODEL")
+        search = None
+        if cfg.valuation.web_search:
+            from .zai_search import ZaiSearch
+
+            search = ZaiSearch()
+            if not search.configured:
+                search = None
+        roster = RosterIndex(db) if db.roster_count() else None
+        engine = ValuationEngine(
+            db, llm, cfg.valuation, search=search, roster=roster,
+            alerters=Alerters(cfg.alerts), radius_miles=cfg.watch.radius_miles,
+        )
+    return DealContext(cfg, db, resolver, origin, engine, forums=cfg.backfill.forums)
+
+
 @app.command(name="watch")
 def watch_cmd(
     config: str = typer.Option(None, "--config", "-c"),
@@ -52,10 +85,11 @@ def watch_cmd(
         console.print("[red]no enabled sources — check config.yaml and .env[/red]")
         raise typer.Exit(1)
     state = _state(cfg)
+    deal_ctx = _deal_boot(cfg, llm)
     intervals = {name: cfg.sources[name].poll_interval for name in adapters}
     watch(
         state, adapters, alerters, intervals, llm=llm,
-        max_alerts=cfg.alerts.max_per_cycle,
+        max_alerts=cfg.alerts.max_per_cycle, deal_ctx=deal_ctx,
     )
 
 
@@ -73,7 +107,9 @@ def poll(
         console.print(f"[red]unknown/disabled source '{source}' (available: {', '.join(adapters)})[/red]")
         raise typer.Exit(1)
     state = _state(cfg)
-    ok = run_poll_cycle(state, adapters, alerters, llm=llm, only=source, max_alerts=cfg.alerts.max_per_cycle)
+    deal_ctx = _deal_boot(cfg, llm)
+    ok = run_poll_cycle(state, adapters, alerters, llm=llm, only=source,
+                        max_alerts=cfg.alerts.max_per_cycle, deal_ctx=deal_ctx)
     raise typer.Exit(0 if ok else 1)
 
 
@@ -104,6 +140,142 @@ def status(config: str = typer.Option(None, "--config", "-c")):
         table.add_row(name, s.last_check or "never", str(len(s.recent_ids)))
     console.print(table)
     console.print(f"[dim]{len(state.keywords())} keyword(s), {len(state.rules())} rule(s)[/dim]")
+    from pathlib import Path
+
+    db_path = Path(cfg.db.path)
+    if db_path.exists():
+        from .db import Db
+
+        db = Db(cfg.db.path)
+        counts = db.counts()
+        size = db.size_bytes()
+        console.print(
+            f"[dim]db: {counts['listings']} listings, {counts['valuations']} valuations, "
+            f"{counts['roster']} roster rows, {counts['comps_archive']} archived comps "
+            f"({size / 1e6:.1f} MB)[/dim]"
+        )
+        for forum in cfg.backfill.forums:
+            p = db.backfill_progress(forum)
+            state_txt = "done" if p["done"] else f"page {p['pages_done']}"
+            console.print(f"[dim]backfill {forum}: {state_txt}[/dim]")
+
+
+# --- deal hunter: backfill / evaluate / deals / roster ---
+
+
+@app.command()
+def backfill(
+    forum: str = typer.Option("all", "--forum", "-f", help="handguns | long_guns | all"),
+    days: int = typer.Option(None, "--days", help="Cutoff age in days (default: config)"),
+    pages: int = typer.Option(0, "--pages", help="Stop after N pages this run (0 = no cap)"),
+    enrich_limit: int = typer.Option(0, "--enrich", help="Extra body-fetch pass for N deferred rows"),
+    config: str = typer.Option(None, "--config", "-c"),
+):
+    """Walk calguns marketplace thread lists into the DB (resumable, throttled)."""
+    from .backfill import run_backfill, run_enrich_backlog
+
+    cfg, adapters, _, _ = _boot(config)
+    if "calguns" not in adapters:
+        console.print("[red]calguns source not enabled[/red]")
+        raise typer.Exit(1)
+    forums = cfg.backfill.forums if forum == "all" else [forum]
+    deal_ctx = _deal_boot(cfg, None)
+    if deal_ctx is None:
+        console.print("[red]valuation disabled in config.yaml — backfill needs it for geo[/red]")
+        raise typer.Exit(1)
+    stats = run_backfill(
+        adapters["calguns"], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin, forums,
+        days=days or cfg.backfill.days, pages_limit=pages,
+        throttle=cfg.backfill.request_interval,
+    )
+    console.print(
+        f"[green]backfill:[/green] {stats['pages']} pages, {stats['new']} new rows, "
+        f"{stats['bodies']} bodies, {stats['geo']} geo-located"
+        + (f" (cutoff reached: {', '.join(stats['done_forums'])})" if stats["done_forums"] else "")
+    )
+    if enrich_limit:
+        done = run_enrich_backlog(
+            adapters["calguns"], deal_ctx.db, deal_ctx.resolver, deal_ctx.origin,
+            cap=enrich_limit, throttle=cfg.backfill.request_interval,
+        )
+        console.print(f"[green]enrich pass:[/green] {done} bodies fetched")
+
+
+@app.command()
+def evaluate(
+    limit: int = typer.Option(10, "--limit", "-l", help="Max listings this run"),
+    loop: bool = typer.Option(False, "--loop", help="Keep draining until the queue is empty"),
+    config: str = typer.Option(None, "--config", "-c"),
+):
+    """Run the LLM valuation (thinking + web search) over the deal queue."""
+    cfg, _, _, llm = _boot(config)
+    if llm is None or not llm.configured:
+        console.print("[red]LLM_API_KEY not set — valuation needs it[/red]")
+        raise typer.Exit(1)
+    deal_ctx = _deal_boot(cfg, llm)
+    if deal_ctx is None or deal_ctx.engine is None:
+        console.print("[red]valuation disabled in config.yaml[/red]")
+        raise typer.Exit(1)
+    try:
+        while True:
+            stats = deal_ctx.engine.run(limit=limit)
+            console.print(
+                f"[green]valued[/green] {stats['valued']}/{stats['queued']} "
+                f"({stats['errors']} errors)"
+            )
+            if not loop or stats["valued"] == 0:
+                break
+    except KeyboardInterrupt:
+        console.print("[yellow]stopped — queue progress is kept in the DB[/yellow]")
+
+
+@app.command()
+def deals(
+    top: int = typer.Option(15, "--top", "-n"),
+    config: str = typer.Option(None, "--config", "-c"),
+):
+    """Best-scoring open listings within the radius."""
+    cfg = load_config(config)
+    from .db import Db
+
+    db = Db(cfg.db.path)
+    rows = db.top_deals(limit=top)
+    if not rows:
+        console.print("[dim]no valuations yet — run `armory backfill` + `armory evaluate`[/dim]")
+        return
+    table = Table(header_style="bold")
+    table.add_column("score", justify="right")
+    table.add_column("verdict")
+    table.add_column("ask", justify="right")
+    table.add_column("est mid", justify="right")
+    table.add_column("dist", justify="right")
+    table.add_column("title", overflow="fold")
+    for r in rows:
+        table.add_row(
+            str(r.get("deal_score")), r.get("verdict") or "",
+            f"${r.get('asking_price') or 0:.0f}", f"${r.get('market_mid') or 0:.0f}",
+            f"{r.get('distance_miles') or 0:.0f}mi",
+            (r.get("title") or "")[:70],
+        )
+    console.print(table)
+
+
+roster_app = typer.Typer(help="Manage the CA handgun roster table.", no_args_is_help=True)
+app.add_typer(roster_app, name="roster")
+
+
+@roster_app.command("refresh")
+def roster_refresh(config: str = typer.Option(None, "--config", "-c")):
+    """Fetch the DOJ certified/de-certified handgun lists into the DB."""
+    cfg = load_config(config)
+    from .db import Db
+    from .http import Fetcher
+    from .roster import fetch_roster
+
+    db = Db(cfg.db.path)
+    entries = fetch_roster(Fetcher("http"))
+    n = db.roster_load(entries)
+    console.print(f"[green]roster loaded:[/green] {n} entries (certified + removed)")
 
 
 # --- keywords ---
@@ -254,6 +426,49 @@ def doctor(config: str = typer.Option(None, "--config", "-c")):
             table.add_row("llm", "[yellow]missing[/yellow]", "set LLM_API_KEY in .env (rules/extraction off until then)")
     else:
         table.add_row("llm", "[dim]disabled[/dim]", "")
+
+    # deal-hunter stack
+    if cfg.valuation.enabled:
+        from .db import Db
+        from .geo import GeoResolver
+
+        db = Db(cfg.db.path)
+        counts = db.counts()
+        table.add_row(
+            "db", "[green]ok[/green]",
+            f"{counts['listings']} listings · {counts['valuations']} valuations · "
+            f"{db.size_bytes() / 1e6:.1f} MB ({cfg.db.path})",
+        )
+        try:
+            resolver = GeoResolver()
+            origin = resolver.origin(cfg.watch.zip)
+            table.add_row(
+                "geo", "[green]ok[/green]",
+                f"origin {cfg.watch.zip} → {origin.lat:.4f},{origin.lon:.4f}; "
+                f"radius {cfg.watch.radius_miles:.0f} mi; {resolver.stats()['zips']} zips, "
+                f"{resolver.stats()['places']} places",
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            table.add_row("geo", "[red]fail[/red]", str(exc)[:120])
+        if counts["roster"]:
+            table.add_row("roster", "[green]ok[/green]", f"{counts['roster']} entries — `armory roster refresh` to update")
+        else:
+            table.add_row("roster", "[yellow]empty[/yellow]", "run `armory roster refresh` for off-roster detection")
+        if secret("LLM_API_KEY"):
+            from .zai_search import ZaiSearch
+
+            zs = ZaiSearch()
+            if zs.configured:
+                detail = zs.ping()
+                status = "[green]ok[/green]" if detail.startswith("ok") else "[yellow]degraded[/yellow]"
+                table.add_row("web-search-mcp", status, detail + " — valuation web tool")
+            else:
+                table.add_row("web-search-mcp", "[dim]off[/dim]", "")
+        table.add_row(
+            "valuation", "[green]ok[/green]" if secret("LLM_API_KEY") else "[yellow]no key[/yellow]",
+            f"model {secret('VALUATION_MODEL') or cfg.valuation.model}, thinking "
+            f"{'on' if cfg.valuation.thinking else 'off'}, alert ≥ {cfg.valuation.alert_min_score}",
+        )
     for chan in ("discord", "imessage"):
         enabled = getattr(cfg.alerts, chan).enabled
         var = "DISCORD_WEBHOOK_URL" if chan == "discord" else "IMESSAGE_TO"

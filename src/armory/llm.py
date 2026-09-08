@@ -33,6 +33,9 @@ Return STRICT JSON only, shaped exactly:
   "price_usd": number or null,
   "condition": "new|like new|very good|good|fair|used|null",
   "wants_to": "wts|wtt|wtb|null",
+  "city": "seller city if stated anywhere in the listing, else null",
+  "state": "two-letter state if stated, else null",
+  "zip": "5-digit zip if stated, else null",
   "ffl_required": true|false|null,
   "scam_risk": "low|medium|high",
   "scam_reason": "short justification when scam_risk is medium/high, else null",
@@ -178,6 +181,95 @@ class LLMClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise LLMError(f"unexpected API response shape: {exc}")
 
+    # --- agentic tool loop (valuation and other multi-round work) ---
+
+    def _anthropic_messages(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
+    ) -> dict:
+        """Full-control Anthropic call returning the parsed response body.
+
+        Raises LLMError; transient failures bubble to the caller for retry.
+        """
+        body: dict = {
+            "model": model or self.model,
+            "max_tokens": 16384,
+            "system": system,
+            "messages": messages,
+        }
+        mode = thinking or self.thinking
+        if mode == "low":
+            body["max_tokens"] = 8192
+            body["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        elif mode != "disabled":
+            body["thinking"] = {"type": "enabled", "budget_tokens": 8192}
+        else:
+            body["thinking"] = {"type": "disabled"}
+        if tools:
+            body["tools"] = tools
+        try:
+            resp = self._client.post(
+                f"{self.base_url}/v1/messages",
+                headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
+                json=body,
+            )
+        except httpx.HTTPError as exc:
+            raise LLMError(f"request failed: {exc}")
+        if resp.status_code == 401:
+            raise LLMError("API key rejected (HTTP 401)")
+        if resp.status_code != 200:
+            raise LLMError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise LLMError(f"unexpected API response shape: {exc}")
+
+    def run_tool_loop(
+        self,
+        system: str,
+        user: str,
+        tool_specs: list[dict],
+        executor,
+        model: str | None = None,
+        thinking: str | None = None,
+        max_rounds: int = 4,
+    ) -> str:
+        """Agentic loop: the model may call client-side tools until it answers.
+
+        executor(name, arguments) -> str feeds each tool_use back as a
+        tool_result. Returns the final text (thinking blocks are ignored).
+        Anthropic-protocol only — the valuation stack targets z.ai.
+        """
+        if not self.anthropic:
+            raise LLMError("tool loop requires an Anthropic-style LLM_API_BASE")
+        messages: list[dict] = [{"role": "user", "content": user}]
+        for _ in range(max_rounds):
+            data = self._anthropic_messages(system, messages, tools=tool_specs, model=model, thinking=thinking)
+            content = data.get("content", [])
+            messages.append({"role": "assistant", "content": content})
+            tool_uses = [b for b in content if b.get("type") == "tool_use"]
+            if not tool_uses:
+                return "".join(b.get("text", "") for b in content if b.get("type") == "text")
+            results = []
+            for block in tool_uses:
+                try:
+                    output = executor(block.get("name", ""), block.get("input", {}) or {})
+                except Exception as exc:  # noqa: BLE001 — report, don't kill the loop
+                    output = f"tool error: {exc}"
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.get("id"),
+                        "content": [{"type": "text", "text": str(output)[:6000]}],
+                    }
+                )
+            messages.append({"role": "user", "content": results})
+        raise LLMError(f"tool loop did not converge in {max_rounds} rounds")
+
     # --- listing classification ---
 
     def classify_batch(self, listings: list[Listing], rules: list[str]) -> dict[str, dict]:
@@ -238,6 +330,9 @@ def apply_result(listing: Listing, result: dict) -> None:
     listing.model = (result.get("model") or None) or listing.model
     listing.item_type = (result.get("item_type") or None) or listing.item_type
     listing.condition = (result.get("condition") or None) or listing.condition
+    listing.city = (result.get("city") or None) or listing.city
+    listing.state = (result.get("state") or None) or listing.state
+    listing.zip = (result.get("zip") or None) or listing.zip
     wants_to = result.get("wants_to")
     if wants_to in ("wts", "wtt", "wtb"):
         listing.wants_to = wants_to

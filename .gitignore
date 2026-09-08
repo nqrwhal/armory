@@ -10,3 +10,5 @@ armory.state.json.lock
 .pytest_cache/
 .zcode/
 gafshub.cookies.json
+armory.db
+armory.db-*

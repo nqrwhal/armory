@@ -5,8 +5,36 @@
 # and fire alerts on first sight of a matching listing.
 
 # Tiny JSON state file: per-source last-check time + recent-ID ring (dedupe),
-# plus your keywords and rules. No database.
+# plus your keywords and rules.
 state_path: armory.state.json
+
+# SQLite: every listing ever seen, valuations, roster, comps. Bodies are
+# truncated (~8 KB) so growth stays in a few MB/month.
+db:
+  path: armory.db
+  retention_days: 0        # 0 = keep everything; e.g. 540 prunes stale rows
+                           # (price history is archived for comps first)
+
+# Deal-hunter geo filter: only listings within this radius of the zip get
+# the full LLM valuation (thinking + web search) and deal alerts.
+watch:
+  zip: "92122"             # UTC / San Diego
+  radius_miles: 100
+
+valuation:
+  enabled: true
+  model: glm-5.3-flash     # env VALUATION_MODEL overrides
+  thinking: true
+  web_search: true         # z.ai web-search MCP, same LLM_API_KEY
+  alert_min_score: 70      # alert at/above this deal score (0-100)
+  max_per_cycle: 2         # valuations per watch cycle (latency-tolerant)
+  eval_window_days: 90     # only recently-active listings get valued
+  sources: [calguns]
+
+backfill:
+  days: 90                 # how deep the one-time calguns walk goes
+  request_interval: 1.5    # seconds between calguns fetches (+jitter)
+  forums: [handguns, long_guns]
 
 sources:
   calguns:

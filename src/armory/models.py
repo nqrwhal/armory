@@ -37,6 +37,9 @@ class Listing:
     condition: str | None = None
     scam_risk: str | None = None
     scam_reason: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
     matched_rules: list[str] = field(default_factory=list)
 
     @property
@@ -80,6 +83,9 @@ class Listing:
             "condition": self.condition,
             "scam_risk": self.scam_risk,
             "scam_reason": self.scam_reason,
+            "city": self.city,
+            "state": self.state,
+            "zip": self.zip,
             "matched_rules": ",".join(self.matched_rules),
         }
 
@@ -88,3 +94,35 @@ class Listing:
 class HealthResult:
     ok: bool
     detail: str
+
+
+@dataclass(slots=True)
+class ThreadRow:
+    """One thread from a forum list page (calguns backfill/live ingest).
+
+    Carries the metadata the thread list gives us for free; the first-post
+    body is fetched lazily only for threads that need it (valuation, or a
+    title that hides price/location).
+    """
+
+    source: str
+    forum: str
+    external_id: str
+    url: str
+    title: str
+    author: str | None = None
+    posted_at: datetime | None = None  # thread start
+    last_post_at: datetime | None = None  # last activity (bumps refresh this)
+    replies: int = 0
+    views: int = 0
+
+    def to_listing(self) -> Listing:
+        return Listing(
+            source=self.source,
+            external_id=self.external_id,
+            url=self.url,
+            title=self.title,
+            author=self.author,
+            posted_at=self.posted_at,
+            category=self.forum,
+        )

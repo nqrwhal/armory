@@ -31,6 +31,35 @@ class LlmConfig(BaseModel):
     enabled: bool = True  # needs LLM_API_KEY in .env; off = keywords only
 
 
+class WatchConfig(BaseModel):
+    """Deal-hunter geo filter: only listings near this origin get valued."""
+
+    zip: str = "92122"
+    radius_miles: float = 100.0
+
+
+class ValuationConfig(BaseModel):
+    enabled: bool = True
+    model: str = "glm-5.3-flash"  # env VALUATION_MODEL wins
+    thinking: bool = True
+    web_search: bool = True       # needs the z.ai web-search MCP (same key)
+    alert_min_score: int = 70     # deal alerts at/above this score
+    max_per_cycle: int = 2        # valuations drained per watch cycle
+    eval_window_days: int = 90    # only recently-active listings get valued
+    sources: list[str] = Field(default_factory=lambda: ["calguns"])
+
+
+class BackfillConfig(BaseModel):
+    days: int = 90
+    request_interval: float = 1.5  # seconds between calguns fetches (+jitter)
+    forums: list[str] = Field(default_factory=lambda: ["handguns", "long_guns"])
+
+
+class DbConfig(BaseModel):
+    path: str = "armory.db"
+    retention_days: int = 0  # 0 = keep everything; bodies are capped, growth is slow
+
+
 class AlertsConfig(BaseModel):
     discord: DiscordConfig = DiscordConfig()
     imessage: ImessageConfig = ImessageConfig()
@@ -43,6 +72,10 @@ class Config(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     alerts: AlertsConfig = AlertsConfig()
     llm: LlmConfig = LlmConfig()
+    watch: WatchConfig = WatchConfig()
+    valuation: ValuationConfig = ValuationConfig()
+    backfill: BackfillConfig = BackfillConfig()
+    db: DbConfig = DbConfig()
 
 
 def find_config_path(explicit: str | None = None) -> Path:
@@ -60,7 +93,9 @@ def load_config(path: str | Path | None = None) -> Config:
         raise FileNotFoundError(f"config not found: {p} (expected config.yaml next to where you run armory)")
     data = yaml.safe_load(p.read_text()) or {}
     cfg = Config.model_validate(data)
-    state_path = Path(cfg.state_path)
-    if not state_path.is_absolute():
-        cfg.state_path = str(p.resolve().parent / state_path)
+    # anchor relative artifact paths to the config file's directory
+    if not Path(cfg.state_path).is_absolute():
+        cfg.state_path = str(p.resolve().parent / cfg.state_path)
+    if not Path(cfg.db.path).is_absolute():
+        cfg.db.path = str(p.resolve().parent / cfg.db.path)
     return cfg

@@ -51,8 +51,12 @@ def poll_source(
     llm: LLMClient | None = None,
     max_alerts: int = 6,
     pages: int = 1,
+    deal_ctx=None,
 ) -> dict[str, int]:
     """Poll one source: detect new listings, enrich + classify, alert on matches.
+
+    With a DealContext, also ingests forum rows into the DB and drains a
+    couple of valuations — the continual-processing side of the deal hunter.
 
     Returns {"polled": n, "new": n, "matched": n, "suppressed": n, "alerts_failed": n}.
     """
@@ -92,6 +96,11 @@ def poll_source(
             result = results.get(listing.external_id)
             if result:
                 apply_result(listing, result)
+                if deal_ctx is not None:
+                    try:
+                        deal_ctx.save_llm(listing)
+                    except Exception:  # noqa: BLE001 — persistence is best-effort
+                        pass
 
     matchers = load_matchers(state)
     matched: list[Listing] = []
@@ -117,6 +126,22 @@ def poll_source(
     state.update_source(adapter.name, all_ids + [l.external_id for l in new], now)
     state.save()
 
+    if deal_ctx is not None:
+        try:
+            ingest_stats = deal_ctx.ingest(adapter)
+            if ingest_stats and (ingest_stats["new"] or ingest_stats["changed"]):
+                _log(
+                    f"{adapter.name}: ingested {ingest_stats['new']} new / "
+                    f"{ingest_stats['changed']} changed forum rows "
+                    f"({ingest_stats['geo']} geo-located, {ingest_stats['bodies']} bodies)"
+                )
+        except Exception as exc:  # noqa: BLE001 — deal pipeline must not kill polling
+            _log(f"{adapter.name}: deal-pipeline ingest error: {exc}")
+        try:
+            deal_ctx.drain()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{adapter.name}: valuation drain error: {exc}")
+
     return {
         "polled": len(listings),
         "new": len(new),
@@ -135,6 +160,7 @@ def run_poll_cycle(
     max_alerts: int = 6,
     only: str | None = None,
     pages: int = 1,
+    deal_ctx=None,
 ) -> bool:
     """Poll sources once. Returns True if any source completed."""
     any_ok = False
@@ -142,7 +168,8 @@ def run_poll_cycle(
         if only and name != only:
             continue
         try:
-            stats = poll_source(state, adapter, alerters, llm=llm, max_alerts=max_alerts, pages=pages)
+            stats = poll_source(state, adapter, alerters, llm=llm, max_alerts=max_alerts,
+                                pages=pages, deal_ctx=deal_ctx)
         except AdapterError as exc:
             _log(f"{name}: {exc}")
             continue
@@ -169,6 +196,7 @@ def watch(
     intervals: dict[str, int],
     llm: LLMClient | None = None,
     max_alerts: int = 6,
+    deal_ctx=None,
 ) -> None:
     """Poll forever, each source on its own interval (±20% jitter)."""
     _log(
@@ -176,6 +204,7 @@ def watch(
         + ", ".join(f"{name} ({intervals.get(name, 300)}s)" for name in adapters)
         + f"; alerts: {alerters.enabled() or 'none'}"
         + ("; llm: on" if llm and llm.configured else "; llm: off (keywords only)")
+        + ("; deals: on" if deal_ctx is not None else "")
     )
     next_at = {name: 0.0 for name in adapters}
     try:
@@ -186,7 +215,8 @@ def watch(
                     # reload so CLI keyword/rule edits land in the live watcher
                     # instead of being clobbered by its next save
                     state = StateStore(state.path)
-                    run_poll_cycle(state, adapters, alerters, llm=llm, max_alerts=max_alerts, only=name)
+                    run_poll_cycle(state, adapters, alerters, llm=llm, max_alerts=max_alerts,
+                                   only=name, deal_ctx=deal_ctx)
                     jitter = random.uniform(0.8, 1.2)
                     next_at[name] = now + intervals.get(name, 300) * jitter
             now = time.time()

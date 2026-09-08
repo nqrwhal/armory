@@ -9,10 +9,12 @@ Personal listing monitor & search across four firearm marketplace/community site
 | **gafshub.com** | Latest topics via Discourse JSON (the GAFS successor after Reddit banned r/GunAccessoriesForSale) | **login required** |
 | **caguns.net** | CAS classifieds listings (XenForo HTML) — behind Cloudflare + an 18+ gate + a classifieds login wall | **login required** |
 
-**No database.** All state lives in one small JSON file (`armory.state.json`):
-per-source last-check timestamps plus a ring of recently-seen listing IDs for
-dedupe, and your keywords/rules. Only genuinely new listings get enriched,
-LLM-classified, and alerted. First run of each source seeds silently.
+Poll state lives in one small JSON file (`armory.state.json`): per-source
+last-check timestamps plus a ring of recently-seen listing IDs for dedupe, and
+your keywords/rules. Only genuinely new listings get enriched, LLM-classified,
+and alerted. First run of each source seeds silently. The deal hunter adds a
+SQLite DB (`armory.db`) for listings, valuations, comps, and the CA roster —
+see [Deal hunter](#deal-hunter-calguns--92122-radius).
 
 ## Setup
 
@@ -36,6 +38,9 @@ cp .env.example .env           # then edit (see below)
 - `LLM_API_KEY` / `LLM_API_BASE` / `LLM_MODEL` — any OpenAI-compatible API, including
   Anthropic-style endpoints (e.g. the GLM coding plan via
   `LLM_API_BASE=https://api.z.ai/api/anthropic`, `LLM_MODEL=glm-5-turbo`).
+- `VALUATION_MODEL` (optional, default `glm-5.3-flash`) and
+  `ZAI_SEARCH_MCP_URL` (optional, default z.ai's web-search MCP) — the deal
+  hunter reuses `LLM_API_KEY` for both.
 
 Both authed sites are free accounts. Cookie lifetimes are long (months) but not forever —
 when they expire `armory doctor` says so and `armory setup` shows how to refresh.
@@ -46,7 +51,7 @@ when they expire `armory doctor` says so and `armory setup` shows how to refresh
 armory watch                  # poll forever (this is what the LaunchAgent runs)
 armory poll [--source X]      # one-shot poll
 armory search "glock 19" [--source tacswap] [--limit N]   # live site search
-armory status                 # state file: last checks, keyword/rule counts
+armory status                 # state file: last checks, keyword/rule counts, db size
 armory keywords add surefire          # case-insensitive whole-word include
 armory keywords add "g\\s*19" --regex # raw regex
 armory keywords add airsoft --exclude # -term: suppress listings mentioning it
@@ -57,6 +62,12 @@ armory rules list | remove "<rule text>"
 armory test-llm               # verify the LLM key with two sample listings
 armory doctor                 # per-source health + alert channel + LLM check
 armory test-alerts            # send a test alert to enabled channels
+
+# deal hunter (see next section)
+armory roster refresh         # load the CA DOJ handgun roster into the DB
+armory backfill [--forum handguns|long_guns|all] [--days 90] [--pages N] [--enrich N]
+armory evaluate [--limit N] [--loop]   # run valuations over the deal queue
+armory deals [--top N]        # best-scoring open listings within radius
 ```
 
 ### Keyword modes and trade/WTB filtering
@@ -88,6 +99,57 @@ to LLM rules too.
   summarized as a "+N more suppressed" note instead of flooding the channel.
 - Edits/bumps don't re-alert (same listing ID = already seen). Nothing is stored
   per listing — after the ID leaves the ring, only the timestamp cutoff applies.
+
+## Deal hunter (calguns → 92122 radius)
+
+On top of keyword alerts, armory continuously parses the calguns marketplace
+(handguns + long guns), keeps every listing in SQLite (`armory.db`), and runs
+an AI valuation on anything for sale within `watch.radius_miles` of
+`watch.zip` (default: 100 mi around 92122 / UTC San Diego):
+
+```
+thread lists ─→ armory.db ─→ geo (zip → city → region; body fallback)
+                           ─→ CA roster lookup (deterministic, fuzzy)
+                           ─→ GLM-5.3-Flash valuation:
+                                thinking ON + web_search tool (z.ai MCP),
+                                local comps from the DB, attachment pricing,
+                                off-roster premium → deal score 0-100
+                           ─→ Discord/iMessage alert at score ≥ 70
+```
+
+- **Backfill** (`armory backfill`) walks the thread lists newest→oldest until
+  everything older than `backfill.days` (90) has been seen, fetching first-post
+  bodies only when the title hides the price/location (~half of them). It is
+  throttled (~1.5 s/request + jitter), resumable (Ctrl-C and re-run), and
+  builds the historical comps the valuations lean on. A full 90-day run is a
+  couple of hours; `--pages N` bounds a session.
+- **Live** — every `armory watch` cycle also ingests page 1 of each gun forum
+  (catching new threads, price edits, and SOLD edits) and drains a couple of
+  valuations (`valuation.max_per_cycle`), so new listings are valued as they
+  arrive without slowing the keyword pipeline.
+- **Valuation** — one GLM-5.3-Flash call per listing (`VALUATION_MODEL`
+  overrides): identity + attachments itemized with values, market range from
+  live web prices (GunBroker/dealers) weighted against local comps, roster
+  status reconciled with the deterministic DOJ lookup (generation mismatches
+  are deliberately escalated to the model rather than guessed), off-roster
+  premium for handguns, and a 0-100 deal score. Score ≥
+  `valuation.alert_min_score` with a good/great verdict alerts; a re-alert
+  only fires when the price drops >5% after the first alert.
+- **Roster** — `armory roster refresh` fetches the DOJ certified + de-certified
+  handgun tables (~3.7k entries) into the DB. Long guns skip roster logic
+  (handgun-only law).
+- **Web search** — the model's `web_search` tool runs through z.ai's web-search
+  MCP server (`https://api.z.ai/api/mcp/web_search_prime/mcp`, same
+  `LLM_API_KEY`, Bearer auth). If it's unreachable the valuation degrades to
+  local comps + roster with no tool calls — nothing crashes.
+- **Disk** — bodies are capped at ~8 KB and rows are ~1 KB; growth is a few
+  MB/month. `db.retention_days` (default 0 = keep everything) prunes stale
+  rows while archiving their price history into `comps_archive` first, so old
+  data keeps feeding comps after pruning.
+- Geo resolution is honest about fuzziness: zips and cities resolve exactly;
+  "SoCal"/"NorCal"-style region tags resolve to a centroid and are tagged as
+  approximate; listings with no resolvable location are stored but never
+  valued or alerted on.
 
 ## Alert etiquette
 
@@ -144,9 +206,17 @@ routine re-exports are rare.
   first search and after any rejection — the discovery GET also primes the GAESA
   edge cookie. No manual maintenance.
 - **calguns** finished a server migration recently (vBulletin 6); if RSS shape changes,
-  the HTML fallback path is `/forum/marketplace/.../page1`.
+  the HTML fallback path is `/forum/marketplace/.../page1`. The deal hunter scrapes
+  those thread-list pages directly (`table.topic-list-container`, stickies skipped,
+  50 threads/page, sorted by last activity); the canonical forum URL is re-derived
+  from the RSS `<category domain>` each session with verified slugs as fallback, so
+  a slug restructure self-heals. List and thread parsers are fixture-tested.
 - **caguns** ads use XenForo `structItem--ad` blocks — the parser is fixture-tested
   (`tests/fixtures/`), so layout changes fail loudly in tests, not silently in prod.
+- **CA DOJ roster pages** (certified + de-certified) are single server-rendered
+  HTML tables with no pagination — if DOJ ever paginates or restructures,
+  `armory roster refresh` errors loudly and the valuation falls back to
+  `unknown` roster status (model-adjudicated via web search).
 
 ## State persistence
 
@@ -161,6 +231,11 @@ competing edits to the same section raise `StateConflictError` instead of silent
 overwriting data. Reload and retry after a conflict. The `.lock` file is persistent;
 do not delete it while processes are running. Restart existing watchers after
 upgrading so all writers use the locking protocol.
+
+The deal-hunter DB (`armory.db`) runs in WAL mode with a 30 s busy timeout, so
+`armory watch`, an in-flight `backfill`, and CLI commands can all touch it at
+once; a `backfill` can be Ctrl-C'd at any point and re-run — per-page progress
+and per-listing rows are committed as they go.
 
 ## Tests
 
