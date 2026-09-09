@@ -286,13 +286,15 @@ class Db:
     # --- valuation queue ---
 
     def valuation_queue(self, window_days: int, radius_miles: float, limit: int = 20,
-                        gun_forums: dict[str, list[str]] | None = None) -> list[dict]:
+                        gun_forums: dict[str, list[str]] | None = None,
+                        exclude_terms: list[str] | None = None) -> list[dict]:
         """In-radius, for-sale, recently-active gun listings needing (re)valuation.
 
         gun_forums maps source → its gun categories (e.g. calguns→handguns,
         caguns→firearms). A listing re-enters the queue when its asking price
         moved >5% from the latest valuation — a price drop is exactly when a
-        fresh opinion matters.
+        fresh opinion matters. exclude_terms (substring, case-insensitive on
+        title/body) hard-skips listings entirely — no valuation, no alert.
         """
         forums_map = gun_forums or {"calguns": ["handguns", "long_guns"]}
         # distance must filter in SQL: a Python-side filter after LIMIT would
@@ -305,6 +307,11 @@ class Db:
             forum_args.append(src)
             forum_args.extend(forums)
         forum_where = " OR ".join(pairs)
+        # exclusions likewise belong under the LIMIT, in SQL
+        exclude_sql, exclude_args = "", []
+        for term in [t for t in (exclude_terms or []) if t.strip()]:
+            exclude_sql += " AND l.title NOT LIKE ? AND COALESCE(l.body, '') NOT LIKE ?"
+            exclude_args.extend([f"%{term}%", f"%{term}%"])
         q = f"""
         SELECT l.*, v.asking_price AS last_ask, v.id AS last_val_id, v.alerted_at
           FROM listings l
@@ -322,10 +329,10 @@ class Db:
              v.id IS NULL
              OR (ABS(COALESCE(v.asking_price, 0) - l.price_usd) / l.price_usd > 0.05
                  AND (v.error IS NULL OR v.created_at < datetime('now', '-7 days')))
-           )
+           ){exclude_sql}
          ORDER BY {_QUEUE_FRESH} DESC
          LIMIT ?"""
-        args = [*forum_args, radius_miles, f"-{window_days} days", limit]
+        args = [*forum_args, radius_miles, f"-{window_days} days", *exclude_args, limit]
         return [dict(r) for r in self.conn.execute(q, args).fetchall()]
 
     def insert_valuation(self, source: str, external_id: str, result: dict, model_used: str) -> int:

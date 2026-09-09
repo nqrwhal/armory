@@ -559,6 +559,32 @@ def test_valuation_per_item_without_total_falls_back_to_unit_price():
     assert v["asking_price"] == 770.0 and v["asking_total"] == 770.0
 
 
+def test_valuation_queue_excludes_terms():
+    db = Db(":memory:")
+    db.upsert_threads("calguns", [
+        now_row("keep1", title="WTS Glock 19 $600"),
+        now_row("drop1", title="WTS Glock 19 with RMR HD $900"),
+    ])
+    for ext in ("keep1", "drop1"):
+        db.conn.execute(
+            "UPDATE listings SET body='some gun' WHERE external_id=?", (ext,)
+        )
+    db.conn.commit()
+    resolver = GeoResolver()
+    origin = resolver.origin("92122")
+    hit = resolver.resolve("El Cajon")
+    for ext in ("keep1", "drop1"):
+        db.set_geo("calguns", ext, hit.lat, hit.lon,
+                   distance_miles(origin.lat, origin.lon, hit.lat, hit.lon), hit.quality,
+                   "El Cajon", None, None)
+    ids = {q["external_id"] for q in db.valuation_queue(90, 100.0, exclude_terms=["rmr hd"])}
+    assert "keep1" in ids and "drop1" not in ids
+    # body-only mentions are excluded too
+    db.conn.execute("UPDATE listings SET body='includes rmr hd optic' WHERE external_id='keep1'")
+    db.conn.commit()
+    assert not db.valuation_queue(90, 100.0, exclude_terms=["rmr hd"])
+
+
 def test_law_playbook_injected_into_valuation_prompt():
     from armory.config import ValuationConfig
     from armory.valuation import ValuationEngine, load_law_playbook

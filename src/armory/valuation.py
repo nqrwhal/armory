@@ -379,6 +379,7 @@ class ValuationEngine:
             radius_miles=self.radius,
             limit=cap,
             gun_forums=self.cfg.gun_forums,
+            exclude_terms=self.cfg.exclude_terms,
         )
         stats = {"queued": len(queue), "valued": 0, "alerted": 0, "errors": 0}
         if not queue:

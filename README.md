@@ -141,7 +141,10 @@ valuation time so only in-radius queue rows cost a request.
   are deliberately escalated to the model rather than guessed), off-roster
   premium for handguns, and a 0-100 deal score. Score ≥
   `valuation.alert_min_score` with a good/great verdict alerts; a re-alert
-  only fires when the price drops >5% after the first alert.
+  only fires when the price drops >5% after the first alert. Deal alerts are
+  score-driven and independent of keywords — to hard-skip listings from the
+  deal pipeline (no valuation, no alert), list substrings in
+  `valuation.exclude_terms` (e.g. `rmr hd`).
 - **Roster** — `armory roster refresh` fetches the DOJ certified + de-certified
   handgun tables (~3.7k entries) into the DB. Long guns skip roster logic
   (handgun-only law).
