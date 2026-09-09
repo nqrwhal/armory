@@ -1,25 +1,10 @@
 #!/usr/bin/env bash
-# Deploy the current repo to the watcher-host watcher and restart it.
-# Server state (.env, armory.state.json, armory.db, venv) is never touched.
+# Update a remote git-clone deployment of armory and restart its watcher.
+# Usage: scripts/deploy.sh <ssh-host> [remote-dir]
+# The remote keeps its own .env / armory.db / armory.state.json (gitignored).
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-HOST="${1:-watcher-host}"
+HOST="${1:?usage: deploy.sh <ssh-host> [remote-dir]}"
 REMOTE_DIR="${2:-\$HOME/armory}"
 
-echo "==> rsync code -> ${HOST}:${REMOTE_DIR}"
-rsync -av --delete \
-  --exclude .venv --exclude .env \
-  --exclude armory.state.json --exclude "armory.state.json.*" \
-  --exclude armory.db --exclude "armory.db-*" \
-  --exclude gafshub.cookies.json \
-  --exclude .git --exclude __pycache__ --exclude "*.pyc" \
-  --exclude .zcode --exclude .pytest_cache \
-  ./ "${HOST}:${REMOTE_DIR}/"
-
-echo "==> install (editable) + restart service"
-ssh "$HOST" "cd ${REMOTE_DIR} && .venv/bin/python -m pip install -q -e . && systemctl --user restart armory && sleep 3 && systemctl --user is-active armory"
-
-echo "==> first cycle output"
-ssh "$HOST" "journalctl --user -u armory -n 5 --no-pager"
-echo "deployed."
+ssh "$HOST" "cd ${REMOTE_DIR} && git pull --ff-only && systemctl --user restart armory && sleep 3 && systemctl --user is-active armory && journalctl --user -u armory -n 5 --no-pager"
